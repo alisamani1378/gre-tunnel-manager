@@ -1,327 +1,296 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# ------------------------------------------------------------------
+#  Universal GRE Tunnel Manager (Refactored)
+#  Author  : Ali Samani – 2025
+#  License : MIT
+# ------------------------------------------------------------------
 
-# --- Comprehensive and Interactive GRE Tunnel Management Script ---
-# This tool creates tunnels, sets up a monitoring service, and ensures their persistence after a reboot.
+set -Eeuo pipefail
+SCRIPT_START=$(date +%s)
 
+# ---------- Constants ---------------------------------------------------------
 CONFIG_FILE="/etc/gre-tunnels.conf"
 PERSISTENCE_SCRIPT="/usr/local/bin/gre-persistence.sh"
 MONITOR_SCRIPT="/usr/local/bin/gre-monitor.sh"
 PERSISTENCE_SERVICE="/etc/systemd/system/gre-persistence.service"
 MONITOR_SERVICE="/etc/systemd/system/gre-monitor.service"
+PING_INTERVAL=10            # seconds
+MONITOR_FAIL_THRESHOLD=3     # pings
 
-# --- Main Functions ---
+# ---------- Pretty print helpers ---------------------------------------------
+NC='\033[0m'
+C_BLUE='\033[0;36m'
+C_GREEN='\033[0;32m'
+C_YELLOW='\033[0;33m'
+C_RED='\033[0;31m'
 
-function create_new_tunnels() {
-    # --- Step 0: Gathering User Information ---
-    echo "############################################################"
-    echo "#            New GRE Tunnel Configuration                #"
-    echo "############################################################"
-    
-    # Initial Questions
-    echo "Please choose the server location:"
-    echo " 1) Iran"
-    echo " 2) Abroad"
-    read -p "Select option (1 for Iran, 2 for Abroad, default: 2): " location_choice
+info()    { echo -e "${C_BLUE}[INFO]${NC}    $*"; }
+success() { echo -e "${C_GREEN}[OK]${NC}      $*"; }
+warn()    { echo -e "${C_YELLOW}[WARN]${NC}   $*"; }
+error()   { echo -e "${C_RED}[ERROR]${NC}  $*" >&2; }
 
-    echo "Do you want to delete existing GRE tunnels first?"
-    echo " 1) Yes"
-    echo " 2) No"
-    read -p "Select option (1 or 2, default: 1): " delete_choice
+# ---------- Root check --------------------------------------------------------
+if [[ $EUID -ne 0 ]]; then
+  error "This script must be run as root (try with sudo)."
+  exit 1
+fi
 
-    echo "Do you want to flush all firewall rules?"
-    echo " 1) Yes"
-    echo " 2) No"
-    read -p "Select option (1 or 2, default: 1): " flush_choice
-
-    # Determine internal IP based on location
-    if [[ "$location_choice" == "1" ]]; then
-        LOCAL_IP_SUFFIX=1
-        GATEWAY_IP_SUFFIX=2
-        echo "✅ Server location set to Iran. Local IPs will end in .1"
-    else
-        LOCAL_IP_SUFFIX=2
-        GATEWAY_IP_SUFFIX=1
-        echo "✅ Server location set to Abroad. Local IPs will end in .2"
-    fi
-
-    # Ask for network interface with a numeric menu
-    echo "--------------------------------------------------"
-    echo "Please select the main public network interface:"
-    mapfile -t INTERFACES < <(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -v "lo")
-    
-    for i in "${!INTERFACES[@]}"; do
-        echo " $((i+1))) ${INTERFACES[$i]}"
-    done
-    echo "--------------------------------------------------"
-
-    while true; do
-        read -p "Select an option (1-${#INTERFACES[@]}): " iface_choice
-        if [[ "$iface_choice" =~ ^[0-9]+$ ]] && [ "$iface_choice" -ge 1 ] && [ "$iface_choice" -le ${#INTERFACES[@]} ]; then
-            MAIN_INTERFACE=${INTERFACES[$((iface_choice-1))]}
-            echo "✅ Interface '$MAIN_INTERFACE' selected."
-            break
-        else
-            echo "❌ Invalid option. Please try again."
-        fi
-    done
-
-    # Ask for remote server IPs
-    echo "--------------------------------------------------"
-    echo "Please enter the destination server IPs one by one."
-    echo "When finished, press [ENTER] on an empty line."
-    declare -a REMOTE_IPS
-    while true; do
-        read -p "Enter remote IP: " ip
-        if [ -z "$ip" ]; then break; fi
-        REMOTE_IPS+=("$ip")
-    done
-
-    if [ ${#REMOTE_IPS[@]} -eq 0 ]; then
-        echo "❌ ERROR: No remote IPs were provided. Cannot create tunnels."
-        exit 1
-    fi
-
-    # Ask for internal IP assignment method
-    echo "--------------------------------------------------"
-    echo "How do you want to assign internal tunnel IPs?"
-    echo " 1) auto   - Automatically generate IPs (e.g., 10.0.0.x, 20.0.0.x)"
-    echo " 2) manual - Manually enter the IP for each tunnel"
-    read -p "Choose an option (1 or 2, default is 1): " mode_choice
-    case "$mode_choice" in
-        2) TUNNEL_IP_MODE="manual" ;;
-        *) TUNNEL_IP_MODE="auto" ;;
-    esac
-    echo "✅ Using '$TUNNEL_IP_MODE' mode for internal IPs."
-    echo "--------------------------------------------------"
-
-    # --- Automated Process Starts ---
-    
-    # Step 1: Delete existing GRE tunnels (based on user response)
-    if [[ "$delete_choice" != "2" ]]; then
-        echo "🔍 Searching for and deleting existing GRE tunnels..."
-        EXISTING_TUNNELS=$(ip -o link show type gre | awk -F': ' '{print $2}' | cut -d'@' -f1)
-        if [ -n "$EXISTING_TUNNELS" ]; then
-            for tunnel in $EXISTING_TUNNELS; do
-                echo "   - Deleting tunnel: $tunnel"
-                sudo ip link delete $tunnel
-            done
-            echo "✅ All existing GRE tunnels have been deleted."
-        else
-            echo "👍 No existing GRE tunnels found to delete."
-        fi
-        echo "--------------------------------------------------"
-    fi
-
-    # Step 2: Flush firewall rules (based on user response)
-    if [[ "$flush_choice" != "2" ]]; then
-        echo "🔥 Flushing all firewall rules..."
-        sudo iptables -P INPUT ACCEPT
-        sudo iptables -P FORWARD ACCEPT
-        sudo iptables -P OUTPUT ACCEPT
-        sudo iptables -t nat -F
-        sudo iptables -t mangle -F
-        sudo iptables -F
-        sudo iptables -X
-        sudo iptables -t nat -X
-        sudo iptables -t mangle -X
-        echo "✅ Firewall rules flushed."
-        echo "--------------------------------------------------"
-    fi
-    
-    # Step 3: IP Detection and Network Setup
-    echo "🌐 Detecting server's public IPv4 address..."
-    LOCAL_IP=$(curl -4 -s icanhazip.com)
-    echo "✅ Public IPv4 detected: $LOCAL_IP"
-    
-    echo "🚀 Enabling IP forwarding and setting up MASQUERADE..."
-    sudo sysctl -w net.ipv4.ip_forward=1
-    sudo iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
-    echo "✅ IP forwarding and NAT are configured."
-    echo "--------------------------------------------------"
-
-    # Step 4: Save Configuration for Services
-    echo "💾 Saving configuration to $CONFIG_FILE..."
-    sudo rm -f $CONFIG_FILE
-    sudo touch $CONFIG_FILE
-    sudo chmod 600 $CONFIG_FILE
-    echo "MAIN_INTERFACE='${MAIN_INTERFACE}'" | sudo tee -a $CONFIG_FILE > /dev/null
-    echo "LOCAL_IP='${LOCAL_IP}'" | sudo tee -a $CONFIG_FILE > /dev/null
-    echo "LOCAL_IP_SUFFIX='${LOCAL_IP_SUFFIX}'" | sudo tee -a $CONFIG_FILE > /dev/null
-    echo "GATEWAY_IP_SUFFIX='${GATEWAY_IP_SUFFIX}'" | sudo tee -a $CONFIG_FILE > /dev/null
-    echo "REMOTE_IPS=(${REMOTE_IPS[@]})" | sudo tee -a $CONFIG_FILE > /dev/null
-    
-    # Step 5: Loop to Create Tunnels and Save Internal IPs
-    echo "Tunnel creation process started..."
-    declare -a INTERNAL_TUNNEL_IPS_ARRAY
-    for i in "${!REMOTE_IPS[@]}"; do
-        TUNNEL_INDEX=$(($i + 1))
-        TUNNEL_NAME="gre${TUNNEL_INDEX}"
-        REMOTE_IP=${REMOTE_IPS[$i]}
-        
-        if [ "$TUNNEL_IP_MODE" == "manual" ]; then
-            read -p "Enter internal IP for tunnel to $REMOTE_IP (e.g., 10.0.0.${LOCAL_IP_SUFFIX}/24): " TUNNEL_IP
-            if [ -z "$TUNNEL_IP" ]; then
-                echo "⚠️ No IP entered. Using automatic mode for this tunnel."
-                TUNNEL_SUBNET_PREFIX=$(( $TUNNEL_INDEX * 10 ))
-                TUNNEL_IP="${TUNNEL_SUBNET_PREFIX}.0.0.${LOCAL_IP_SUFFIX}/24"
-            fi
-        else
-            TUNNEL_SUBNET_PREFIX=$(( $TUNNEL_INDEX * 10 ))
-            TUNNEL_IP="${TUNNEL_SUBNET_PREFIX}.0.0.${LOCAL_IP_SUFFIX}/24"
-        fi
-        INTERNAL_TUNNEL_IPS_ARRAY+=("$TUNNEL_IP")
-
-        echo "Creating tunnel #$TUNNEL_INDEX: $TUNNEL_NAME..."
-        sudo ip tunnel add $TUNNEL_NAME mode gre remote $REMOTE_IP local $LOCAL_IP ttl 255
-        sudo ip addr add $TUNNEL_IP dev $TUNNEL_NAME
-        sudo ip link set $TUNNEL_NAME up
-        echo "✅ Tunnel $TUNNEL_NAME is UP."
-    done
-    echo "INTERNAL_TUNNEL_IPS=(${INTERNAL_TUNNEL_IPS_ARRAY[@]})" | sudo tee -a $CONFIG_FILE > /dev/null
-    echo "--------------------------------------------------"
-
-    # Step 6: Create Scripts and Services
-    create_persistence_service
-    create_monitor_service
-
-    # Step 7: Activate and Start Services
-    echo "🚀 Activating and starting services..."
-    sudo systemctl daemon-reload
-    sudo systemctl enable gre-persistence.service gre-monitor.service
-    sudo systemctl restart gre-persistence.service gre-monitor.service
-    echo "✅ All services are enabled and active."
-    echo "🎉 Setup complete!"
+# ---------- Utils -------------------------------------------------------------
+is_valid_ip() {
+  local ip=$1
+  [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS=. read -r o1 o2 o3 o4 <<<"$ip"
+  for o in $o1 $o2 $o3 $o4; do
+    ((o <= 255)) || return 1
+  done
 }
 
-function create_persistence_service() {
-    echo "🛠️ Creating persistence script and service..."
-    # Create script to restore tunnels and rules on boot
-    sudo bash -c "cat > $PERSISTENCE_SCRIPT" <<EOF
-#!/bin/bash
-# This script is auto-generated to restore GRE tunnels on boot.
-source $CONFIG_FILE
+prompt_default() { # $1=question  $2=default
+  local ans
+  read -r -p "$1 [$2]: " ans
+  echo "${ans:-$2}"
+}
 
-# Restore firewall and NAT
-sysctl -w net.ipv4.ip_forward=1
-iptables -t nat -A POSTROUTING -o \$MAIN_INTERFACE -j MASQUERADE
+# ---------- Core functions ----------------------------------------------------
+create_new_tunnels() {
+  clear
+  info "------------- GRE Tunnel Configuration Wizard -------------"
 
-# Restore tunnels
-for i in "\${!REMOTE_IPS[@]}"; do
-    TUNNEL_INDEX=\$((i + 1))
-    TUNNEL_NAME="gre\${TUNNEL_INDEX}"
-    REMOTE_IP=\${REMOTE_IPS[i]}
-    TUNNEL_IP=\${INTERNAL_TUNNEL_IPS[i]}
-    
-    ip tunnel add \$TUNNEL_NAME mode gre remote \$REMOTE_IP local \$LOCAL_IP ttl 255
-    ip addr add \$TUNNEL_IP dev \$TUNNEL_NAME
-    ip link set \$TUNNEL_NAME up
-done
+  # 1️⃣ Location
+  local location_choice
+  location_choice=$(prompt_default "Choose server location (1=Iran, 2=Abroad)" "2")
+  case $location_choice in
+    1) LOCAL_IP_SUFFIX=1; GATEWAY_IP_SUFFIX=2 ;;
+    2) LOCAL_IP_SUFFIX=2; GATEWAY_IP_SUFFIX=1 ;;
+    *) warn "Invalid choice. Defaulting to Abroad."; LOCAL_IP_SUFFIX=2; GATEWAY_IP_SUFFIX=1 ;;
+  esac
+  success "Server location set. Internal IPs will end with .$LOCAL_IP_SUFFIX"
+
+  # 2️⃣ Delete existing tunnels / flush FW?
+  local delete_choice flush_choice
+  delete_choice=$(prompt_default "Delete existing GRE tunnels first? (1=Yes,2=No)" "1")
+  flush_choice=$(prompt_default "Flush ALL firewall rules? (1=Yes,2=No)" "1")
+
+  # 3️⃣ Select network interface
+  mapfile -t INTERFACES < <(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -v "lo")
+  echo "--------------------------------------------------"
+  for i in "${!INTERFACES[@]}"; do echo " $((i+1))) ${INTERFACES[$i]}"; done
+  echo "--------------------------------------------------"
+
+  local iface_choice MAIN_INTERFACE
+  while true; do
+    iface_choice=$(prompt_default "Select main interface" "1")
+    if [[ "$iface_choice" =~ ^[0-9]+$ ]] && ((iface_choice>=1 && iface_choice<=${#INTERFACES[@]})); then
+      MAIN_INTERFACE=${INTERFACES[$((iface_choice-1))]}
+      break
+    else warn "Invalid option. Try again."; fi
+  done
+  success "Interface '$MAIN_INTERFACE' selected."
+
+  # 4️⃣ Enter remote IPs
+  info "Enter destination server IPs (blank line to finish):"
+  REMOTE_IPS=()
+  while :; do
+    read -r -p "Remote IP: " ip
+    [[ -z $ip ]] && break
+    if is_valid_ip "$ip"; then REMOTE_IPS+=("$ip"); else warn "Invalid IP, ignored."; fi
+  done
+  (( ${#REMOTE_IPS[@]} )) || { error "No valid IPs supplied."; return; }
+
+  # 5️⃣ Internal IP mode
+  local mode_choice TUNNEL_IP_MODE
+  mode_choice=$(prompt_default "Assign internal IPs (1=auto, 2=manual)" "1")
+  TUNNEL_IP_MODE=$([[ $mode_choice == 2 ]] && echo "manual" || echo "auto")
+  success "Internal IP assignment mode: $TUNNEL_IP_MODE"
+
+  # ---------- Cleanup (optional) ----------------
+  if [[ $delete_choice != 2 ]]; then
+    info "Deleting existing GRE tunnels..."
+    ip -o link show type gre | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r tun; do
+      [[ -n $tun ]] && ip link delete "$tun" && echo "  - $tun removed."
+    done
+  fi
+
+  if [[ $flush_choice != 2 ]]; then
+    info "Flushing iptables rules..."
+    iptables -F; iptables -t nat -F; iptables -t mangle -F
+    iptables -X; iptables -t nat -X; iptables -t mangle -X
+    nft list tables &>/dev/null && nft flush ruleset || true
+  fi
+
+  # ---------- Basic net config ---------------
+  info "Enabling IP forwarding and NAT..."
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  iptables -t nat -C POSTROUTING -o "$MAIN_INTERFACE" -j MASQUERADE 2>/dev/null \
+    || iptables -t nat -A POSTROUTING -o "$MAIN_INTERFACE" -j MASQUERADE
+
+  nft list tables &>/dev/null && {
+    nft list table ip nat &>/dev/null || nft add table ip nat
+    nft list chain ip nat postrouting &>/dev/null || nft add chain ip nat postrouting '{ type nat hook postrouting priority 100 ; }'
+    nft insert rule ip nat postrouting oifname "$MAIN_INTERFACE" masquerade
+  } || true
+  success "IP forwarding & NAT configured."
+
+  LOCAL_IP=$(curl -4 -s icanhazip.com || true)
+  [[ -z $LOCAL_IP ]] && { error "Couldn't auto-detect public IP"; exit 1; }
+  success "Public IP detected: $LOCAL_IP"
+
+  # ---------- Save base config ---------------
+  info "Saving base config → $CONFIG_FILE"
+  cat > "$CONFIG_FILE" <<EOF
+MAIN_INTERFACE="$MAIN_INTERFACE"
+LOCAL_IP="$LOCAL_IP"
+LOCAL_IP_SUFFIX=$LOCAL_IP_SUFFIX
+GATEWAY_IP_SUFFIX=$GATEWAY_IP_SUFFIX
+REMOTE_IPS=(${REMOTE_IPS[*]})
 EOF
-    sudo chmod +x $PERSISTENCE_SCRIPT
 
-    # Create persistence service file
-    sudo bash -c "cat > $PERSISTENCE_SERVICE" <<EOF
+  # ---------- Create tunnels -----------------
+  INTERNAL_TUNNEL_IPS=()
+  info "Creating tunnels..."
+  for idx in "${!REMOTE_IPS[@]}"; do
+    local REMOTE="${REMOTE_IPS[$idx]}"
+    local TUN="gre$((idx+1))"
+    local SUBNET_BASE=$(( (idx+1) * 10 ))
+    local TUN_IP
+
+    if [[ $TUNNEL_IP_MODE == manual ]]; then
+      read -r -p "Internal IP for tunnel $TUN → $REMOTE (e.g. ${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/24): " TUN_IP
+      is_valid_ip "${TUN_IP%%/*}" || { warn "Invalid IP, using auto."; TUN_IP="${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/24"; }
+    else
+      TUN_IP="${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/24"
+    fi
+    INTERNAL_TUNNEL_IPS+=("$TUN_IP")
+
+    ip link show "$TUN" &>/dev/null || ip tunnel add "$TUN" mode gre remote "$REMOTE" local "$LOCAL_IP" ttl 255
+    ip addr show dev "$TUN" | grep -q "$TUN_IP" || ip addr add "$TUN_IP" dev "$TUN"
+    ip link set "$TUN" up
+    echo "  • $TUN ↔ $REMOTE  [$TUN_IP]"
+  done
+  echo "INTERNAL_TUNNEL_IPS=(${INTERNAL_TUNNEL_IPS[*]})" >> "$CONFIG_FILE"
+
+  # ---------- Create services ----------------
+  create_persistence_service
+  create_monitor_service
+
+  systemctl daemon-reload
+  systemctl enable --now gre-persistence.service gre-monitor.service
+
+  success "All done! Total time: $(( $(date +%s) - SCRIPT_START )) s"
+  info    "Reboot is NOT required, tunnels are live now."
+}
+
+create_persistence_service() {
+  info "Building persistence service..."
+  cat > "$PERSISTENCE_SCRIPT" <<'BASH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ -f /etc/gre-tunnels.conf ]] || exit 0
+source /etc/gre-tunnels.conf
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+iptables -t nat -C POSTROUTING -o "$MAIN_INTERFACE" -j MASQUERADE 2>/dev/null \
+  || iptables -t nat -A POSTROUTING -o "$MAIN_INTERFACE" -j MASQUERADE
+
+for i in "${!REMOTE_IPS[@]}"; do
+  TUN="gre$((i+1))"
+  ip link show "$TUN" &>/dev/null || ip tunnel add "$TUN" mode gre remote "${REMOTE_IPS[$i]}" local "$LOCAL_IP" ttl 255
+  ip addr show dev "$TUN" | grep -q "${INTERNAL_TUNNEL_IPS[$i]}" || ip addr add "${INTERNAL_TUNNEL_IPS[$i]}" dev "$TUN"
+  ip link set "$TUN" up
+done
+BASH
+  chmod +x "$PERSISTENCE_SCRIPT"
+
+  cat > "$PERSISTENCE_SERVICE" <<EOF
 [Unit]
-Description=GRE Tunnels Persistence Service
+Description=Restore GRE tunnels at boot
 After=network-online.target
 Wants=network-online.target
+ConditionPathExists=$CONFIG_FILE
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash $PERSISTENCE_SCRIPT
+ExecStart=$PERSISTENCE_SCRIPT
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    echo "✅ Persistence service created."
+  success "Persistence unit created."
 }
 
-function create_monitor_service() {
-    echo "🛠️ Creating monitoring script and service..."
-    # Create monitoring script
-    sudo bash -c "cat > $MONITOR_SCRIPT" <<EOF
-#!/bin/bash
-# This script is auto-generated to keep tunnels alive.
-source $CONFIG_FILE
+create_monitor_service() {
+  info "Building monitor service..."
+  cat > "$MONITOR_SCRIPT" <<'BASH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ -f /etc/gre-tunnels.conf ]] || exit 0
+source /etc/gre-tunnels.conf
+INTERVAL=${PING_INTERVAL:-10}
+THRESHOLD=${MONITOR_FAIL_THRESHOLD:-3}
 
 while true; do
-EOF
-    # Add ping loop to monitoring script
-    for i in "${!INTERNAL_TUNNEL_IPS_ARRAY[@]}"; do
-        IP_BASE=$(echo ${INTERNAL_TUNNEL_IPS_ARRAY[$i]} | cut -d'/' -f1)
-        SUBNET_BASE=$(echo $IP_BASE | cut -d'.' -f1-3)
-        GATEWAY_IP="${SUBNET_BASE}.${GATEWAY_IP_SUFFIX}"
-        echo "    /bin/ping -c 2 $GATEWAY_IP > /dev/null 2>&1" | sudo tee -a $MONITOR_SCRIPT > /dev/null
-    done
-    sudo bash -c "cat >> $MONITOR_SCRIPT" <<EOF
-    sleep 10
+  for i in "${!REMOTE_IPS[@]}"; do
+    SUBNET="$(echo "${INTERNAL_TUNNEL_IPS[$i]}" | cut -d'/' -f1 | cut -d'.' -f1-3)"
+    GW="${SUBNET}.${GATEWAY_IP_SUFFIX}"
+    if ! ping -c "$THRESHOLD" -W 2 "$GW" &>/dev/null; then
+      TUN="gre$((i+1))"
+      ip link set "$TUN" down || true
+      ip link set "$TUN" up   || true
+    fi
+  done
+  sleep "$INTERVAL"
 done
-EOF
-    sudo chmod +x $MONITOR_SCRIPT
+BASH
+  chmod +x "$MONITOR_SCRIPT"
 
-    # Create monitoring service file
-    sudo bash -c "cat > $MONITOR_SERVICE" <<EOF
+  cat > "$MONITOR_SERVICE" <<EOF
 [Unit]
-Description=GRE Tunnel Keep-Alive Ping Service
+Description=Keep GRE tunnels alive
 After=gre-persistence.service
 Wants=gre-persistence.service
+ConditionPathExists=$CONFIG_FILE
 
 [Service]
-ExecStart=/bin/bash $MONITOR_SCRIPT
+ExecStart=$MONITOR_SCRIPT
 Restart=always
-RestartSec=10
-User=root
+RestartSec=$PING_INTERVAL
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    echo "✅ Monitoring service created."
+  success "Monitor unit created."
 }
 
-function delete_all_tunnels() {
-    echo "⚠️ This will stop and disable all related services and delete all GRE tunnels."
-    read -p "Are you sure? (y/n): " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo "Operation cancelled."
-        return
-    fi
+delete_all_tunnels() {
+  warn "This will remove EVERY tunnel, config & service created by this tool."
+  read -r -p "Really continue? (y/N): " confirm
+  [[ $confirm =~ ^[Yy]$ ]] || { info "Aborted."; return; }
 
-    echo "Stopping and disabling services..."
-    sudo systemctl stop gre-persistence.service gre-monitor.service &>/dev/null || true
-    sudo systemctl disable gre-persistence.service gre-monitor.service &>/dev/null || true
-    
-    echo "Deleting service files and scripts..."
-    sudo rm -f $PERSISTENCE_SERVICE $MONITOR_SERVICE
-    sudo rm -f $PERSISTENCE_SCRIPT $MONITOR_SCRIPT
-    sudo rm -f $CONFIG_FILE
-    sudo systemctl daemon-reload
+  systemctl stop gre-monitor.service gre-persistence.service 2>/dev/null || true
+  systemctl disable gre-monitor.service gre-persistence.service 2>/dev/null || true
+  rm -f "$MONITOR_SERVICE" "$PERSISTENCE_SERVICE" "$MONITOR_SCRIPT" "$PERSISTENCE_SCRIPT" "$CONFIG_FILE"
+  systemctl daemon-reload
 
-    echo "Deleting GRE tunnels..."
-    EXISTING_TUNNELS=$(ip -o link show type gre | awk -F': ' '{print $2}' | cut -d'@' -f1)
-    if [ -n "$EXISTING_TUNNELS" ]; then
-        for tunnel in $EXISTING_TUNNELS; do
-            echo "   - Deleting tunnel: $tunnel"
-            sudo ip link delete $tunnel
-        done
-    fi
-    echo "✅ Cleanup complete."
+  ip -o link show type gre | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r tun; do
+    [[ -n $tun ]] && ip link delete "$tun" && echo "  - $tun removed."
+  done
+
+  success "Cleanup complete."
 }
 
-# --- Main Menu ---
-function main_menu() {
-    echo "--------------------------------------------------"
-    echo "              GRE Tunnel Manager Menu"
-    echo "--------------------------------------------------"
-    echo " 1) Create / Reconfigure Tunnels"
-    echo " 2) Delete All Tunnels and Services"
-    echo " 3) Exit"
-    read -p "Select an option: " choice
-    case $choice in
-        1) create_new_tunnels ;;
-        2) delete_all_tunnels ;;
-        3) exit 0 ;;
-        *) echo "Invalid option. Exiting."; exit 1 ;;
-    esac
+main_menu() {
+  clear
+  echo "--------- GRE Tunnel Manager ---------"
+  echo " 1) Create / Reconfigure tunnels"
+  echo " 2) Delete ALL tunnels & services"
+  echo " 3) Exit"
+  read -r -p "Select an option: " choice
+  case $choice in
+    1) create_new_tunnels ;;
+    2) delete_all_tunnels ;;
+    3) exit 0 ;;
+    *) error "Invalid choice."; exit 1 ;;
+  esac
 }
 
 main_menu
