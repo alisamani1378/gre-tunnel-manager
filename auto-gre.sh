@@ -58,18 +58,18 @@ create_new_tunnels() {
 
   # 1️⃣ Location
   local location_choice
-  location_choice=$(prompt_default "Choose server location (1=Iran, 2=Abroad)" "2")
+  location_choice=$(prompt_default "مکان سرور را انتخاب کنید (1=ایران, 2=خارج)" "2")
   case $location_choice in
     1) LOCAL_IP_SUFFIX=1; GATEWAY_IP_SUFFIX=2 ;;
     2) LOCAL_IP_SUFFIX=2; GATEWAY_IP_SUFFIX=1 ;;
-    *) warn "Invalid choice. Defaulting to Abroad."; LOCAL_IP_SUFFIX=2; GATEWAY_IP_SUFFIX=1 ;;
+    *) warn "انتخاب نامعتبر. پیش‌فرض خارج در نظر گرفته شد."; LOCAL_IP_SUFFIX=2; GATEWAY_IP_SUFFIX=1 ;;
   esac
-  success "Server location set. Internal IPs will end with .$LOCAL_IP_SUFFIX"
+  success "مکان سرور تنظیم شد. IP داخلی با .$LOCAL_IP_SUFFIX پایان می‌یابد"
 
   # 2️⃣ Delete existing tunnels / flush FW?
   local delete_choice flush_choice
-  delete_choice=$(prompt_default "Delete existing GRE tunnels first? (1=Yes,2=No)" "1")
-  flush_choice=$(prompt_default "Flush ALL firewall rules? (1=Yes,2=No)" "1")
+  delete_choice=$(prompt_default "تونل‌های GRE قبلی حذف شوند؟ (1=بله, 2=خیر)" "1")
+  flush_choice=$(prompt_default "تمام قوانین فایروال پاک شوند؟ (1=بله, 2=خیر)" "1")
 
   # 3️⃣ Select network interface
   mapfile -t INTERFACES < <(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -v "lo")
@@ -79,75 +79,58 @@ create_new_tunnels() {
 
   local iface_choice MAIN_INTERFACE
   while true; do
-    iface_choice=$(prompt_default "Select main interface" "1")
+    iface_choice=$(prompt_default "اینترفیس اصلی شبکه را انتخاب کنید" "1")
     if [[ "$iface_choice" =~ ^[0-9]+$ ]] && ((iface_choice>=1 && iface_choice<=${#INTERFACES[@]})); then
       MAIN_INTERFACE=${INTERFACES[$((iface_choice-1))]}
       break
-    else warn "Invalid option. Try again."; fi
+    else warn "گزینه نامعتبر است. دوباره تلاش کنید."; fi
   done
-  success "Interface '$MAIN_INTERFACE' selected."
+  success "اینترفیس '$MAIN_INTERFACE' انتخاب شد."
 
   # 4️⃣ Enter remote IPs
-  info "Enter destination server IPs (blank line to finish):"
+  info "IP سرورهای مقصد را وارد کنید (برای پایان خط خالی):"
   REMOTE_IPS=()
   while :; do
-    read -r -p "Remote IP: " ip
+    read -r -p "IP ریموت: " ip
     [[ -z $ip ]] && break
-    if is_valid_ip "$ip"; then REMOTE_IPS+=("$ip"); else warn "Invalid IP, ignored."; fi
+    if is_valid_ip "$ip"; then REMOTE_IPS+=("$ip"); else warn "IP نامعتبر، نادیده گرفته شد."; fi
   done
-  (( ${#REMOTE_IPS[@]} )) || { error "No valid IPs supplied."; return; }
+  (( ${#REMOTE_IPS[@]} )) || { error "هیچ IP معتبری وارد نشد."; return; }
 
   # 5️⃣ Internal IP mode
   local mode_choice TUNNEL_IP_MODE
-  mode_choice=$(prompt_default "Assign internal IPs (1=auto, 2=manual)" "1")
+  mode_choice=$(prompt_default "نحوه تخصیص IP داخلی (1=خودکار, 2=دستی)" "1")
   TUNNEL_IP_MODE=$([[ $mode_choice == 2 ]] && echo "manual" || echo "auto")
-  success "Internal IP assignment mode: $TUNNEL_IP_MODE"
+  success "حالت تخصیص IP داخلی: $TUNNEL_IP_MODE"
 
   # ---------- Cleanup (optional) ----------------
   if [[ $delete_choice != 2 ]]; then
-    info "Deleting existing GRE tunnels..."
+    info "در حال حذف تونل‌های GRE موجود..."
     ip -o link show type gre | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r tun; do
-      [[ -n $tun ]] && ip link delete "$tun" && echo "  - $tun removed."
+      [[ -n $tun ]] && sudo ip link delete "$tun" && echo "  - $tun حذف شد."
     done
   fi
 
   if [[ $flush_choice != 2 ]]; then
-    info "Flushing iptables rules..."
-    iptables -F; iptables -t nat -F; iptables -t mangle -F
-    iptables -X; iptables -t nat -X; iptables -t mangle -X
-    nft list tables &>/dev/null && nft flush ruleset || true
+    info "در حال پاکسازی قوانین iptables..."
+    sudo iptables -F; sudo iptables -t nat -F; sudo iptables -t mangle -F
+    sudo iptables -X; sudo iptables -t nat -X; sudo iptables -t mangle -X
   fi
 
   # ---------- Basic net config ---------------
-  info "Enabling IP forwarding and NAT..."
-  sysctl -w net.ipv4.ip_forward=1 >/dev/null
-  iptables -t nat -C POSTROUTING -o "$MAIN_INTERFACE" -j MASQUERADE 2>/dev/null \
-    || iptables -t nat -A POSTROUTING -o "$MAIN_INTERFACE" -j MASQUERADE
-
-  nft list tables &>/dev/null && {
-    nft list table ip nat &>/dev/null || nft add table ip nat
-    nft list chain ip nat postrouting &>/dev/null || nft add chain ip nat postrouting '{ type nat hook postrouting priority 100 ; }'
-    nft insert rule ip nat postrouting oifname "$MAIN_INTERFACE" masquerade
-  } || true
-  success "IP forwarding & NAT configured."
+  info "در حال فعال‌سازی IP forwarding و NAT..."
+  sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  sudo iptables -t nat -C POSTROUTING -o "$MAIN_INTERFACE" -j MASQUERADE 2>/dev/null \
+    || sudo iptables -t nat -A POSTROUTING -o "$MAIN_INTERFACE" -j MASQUERADE
+  success "IP forwarding و NAT تنظیم شد."
 
   LOCAL_IP=$(curl -4 -s icanhazip.com || true)
-  [[ -z $LOCAL_IP ]] && { error "Couldn't auto-detect public IP"; exit 1; }
-  success "Public IP detected: $LOCAL_IP"
-
-  # ---------- Save base config ---------------
-  info "Saving base config → $CONFIG_FILE"
-  cat > "$CONFIG_FILE" <<EOF
-MAIN_INTERFACE="$MAIN_INTERFACE"
-LOCAL_IP="$LOCAL_IP"
-LOCAL_IP_SUFFIX=$LOCAL_IP_SUFFIX
-GATEWAY_IP_SUFFIX=$GATEWAY_IP_SUFFIX
-REMOTE_IPS=(${REMOTE_IPS[*]})
-EOF
+  [[ -z $LOCAL_IP ]] && { error "شناسایی IP پابلیک ممکن نبود"; exit 1; }
+  success "IP پابلیک شناسایی شد: $LOCAL_IP"
 
   # ---------- Create tunnels -----------------
   INTERNAL_TUNNEL_IPS=()
-  info "Creating tunnels..."
+  info "در حال ساخت تونل‌ها..."
   for idx in "${!REMOTE_IPS[@]}"; do
     local REMOTE="${REMOTE_IPS[$idx]}"
     local TUN="gre$((idx+1))"
@@ -155,33 +138,78 @@ EOF
     local TUN_IP
 
     if [[ $TUNNEL_IP_MODE == manual ]]; then
-      read -r -p "Internal IP for tunnel $TUN → $REMOTE (e.g. ${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/24): " TUN_IP
-      is_valid_ip "${TUN_IP%%/*}" || { warn "Invalid IP, using auto."; TUN_IP="${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/24"; }
+      read -r -p "IP داخلی برای تونل $TUN → $REMOTE (مثال: ${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/24): " TUN_IP
+      is_valid_ip "${TUN_IP%%/*}" || { warn "IP نامعتبر، از حالت خودکار استفاده می‌شود."; TUN_IP="${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/24"; }
     else
       TUN_IP="${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/24"
     fi
     INTERNAL_TUNNEL_IPS+=("$TUN_IP")
 
-    ip link show "$TUN" &>/dev/null || ip tunnel add "$TUN" mode gre remote "$REMOTE" local "$LOCAL_IP" ttl 255
-    ip addr show dev "$TUN" | grep -q "$TUN_IP" || ip addr add "$TUN_IP" dev "$TUN"
-    ip link set "$TUN" up
+    sudo ip link show "$TUN" &>/dev/null || sudo ip tunnel add "$TUN" mode gre remote "$REMOTE" local "$LOCAL_IP" ttl 255
+    sudo ip addr show dev "$TUN" | grep -q "$TUN_IP" || sudo ip addr add "$TUN_IP" dev "$TUN"
+    sudo ip link set "$TUN" up
     echo "  • $TUN ↔ $REMOTE  [$TUN_IP]"
   done
-  echo "INTERNAL_TUNNEL_IPS=(${INTERNAL_TUNNEL_IPS[*]})" >> "$CONFIG_FILE"
+
+  # ---------- Port Forwarding Setup (New) ----------------
+  declare -a FORWARDING_RULES
+  if [[ "$location_choice" == "1" ]]; then
+      info "------------- تنظیمات Port Forwarding -------------"
+      for i in "${!REMOTE_IPS[@]}"; do
+          while true; do
+              read -r -p "برای تونل به مقصد ${REMOTE_IPS[$i]} قانون Port Forwarding اضافه شود؟ (y/n): " add_forward
+              [[ $add_forward =~ ^[Yy]$ ]] || break
+
+              read -r -p "  پورت مورد نظر برای فوروارد (مثال: 8080): " PORT
+              read -r -p "  پروتکل (tcp/udp): " PROTOCOL
+
+              DEST_IP=$(echo "${INTERNAL_TUNNEL_IPS[$i]}" | cut -d'/' -f1)
+              SOURCE_IP_BASE=$(echo "$DEST_IP" | cut -d'.' -f1-3)
+              SOURCE_IP="${SOURCE_IP_BASE}.${LOCAL_IP_SUFFIX}"
+              
+              PREROUTING_RULE="iptables -t nat -A PREROUTING -p $PROTOCOL --dport $PORT -j DNAT --to-destination ${DEST_IP}:${PORT}"
+              POSTROUTING_RULE="iptables -t nat -A POSTROUTING -p $PROTOCOL -d $DEST_IP --dport $PORT -j SNAT --to-source $SOURCE_IP"
+              
+              info "  در حال اعمال قانون: $PREROUTING_RULE"
+              eval "$PREROUTING_RULE"
+              info "  در حال اعمال قانون: $POSTROUTING_RULE"
+              eval "$POSTROUTING_RULE"
+
+              FORWARDING_RULES+=("$PREROUTING_RULE" "$POSTROUTING_RULE")
+              success "قانون فوروارد برای پورت $PORT/$PROTOCOL اضافه شد."
+          done
+      done
+  fi
+  
+  # ---------- Save config ---------------
+  info "در حال ذخیره تنظیمات → $CONFIG_FILE"
+  {
+    echo "MAIN_INTERFACE=\"$MAIN_INTERFACE\""
+    echo "LOCAL_IP=\"$LOCAL_IP\""
+    echo "LOCAL_IP_SUFFIX=$LOCAL_IP_SUFFIX"
+    echo "GATEWAY_IP_SUFFIX=$GATEWAY_IP_SUFFIX"
+    echo "REMOTE_IPS=(${REMOTE_IPS[*]})"
+    echo "INTERNAL_TUNNEL_IPS=(${INTERNAL_TUNNEL_IPS[*]})"
+    # Save forwarding rules safely
+    printf "FORWARDING_RULES=("
+    for rule in "${FORWARDING_RULES[@]}"; do printf "%q " "$rule"; done
+    printf ")\n"
+  } > "$CONFIG_FILE"
+
 
   # ---------- Create services ----------------
   create_persistence_service
   create_monitor_service
 
-  systemctl daemon-reload
-  systemctl enable --now gre-persistence.service gre-monitor.service
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now gre-persistence.service gre-monitor.service
 
-  success "All done! Total time: $(( $(date +%s) - SCRIPT_START )) s"
-  info    "Reboot is NOT required, tunnels are live now."
+  success "پایان یافت! زمان کل: $(( $(date +%s) - SCRIPT_START )) ثانیه"
+  info    "نیازی به ریبوت نیست، تونل‌ها فعال هستند."
 }
 
 create_persistence_service() {
-  info "Building persistence service..."
+  info "در حال ساخت سرویس پایداری..."
   cat > "$PERSISTENCE_SCRIPT" <<'BASH'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -197,6 +225,11 @@ for i in "${!REMOTE_IPS[@]}"; do
   ip link show "$TUN" &>/dev/null || ip tunnel add "$TUN" mode gre remote "${REMOTE_IPS[$i]}" local "$LOCAL_IP" ttl 255
   ip addr show dev "$TUN" | grep -q "${INTERNAL_TUNNEL_IPS[$i]}" || ip addr add "${INTERNAL_TUNNEL_IPS[$i]}" dev "$TUN"
   ip link set "$TUN" up
+done
+
+# Restore custom port forwarding rules
+for rule in "${FORWARDING_RULES[@]}"; do
+    eval "$rule"
 done
 BASH
   chmod +x "$PERSISTENCE_SCRIPT"
@@ -215,11 +248,11 @@ ExecStart=$PERSISTENCE_SCRIPT
 [Install]
 WantedBy=multi-user.target
 EOF
-  success "Persistence unit created."
+  success "سرویس پایداری ایجاد شد."
 }
 
 create_monitor_service() {
-  info "Building monitor service..."
+  info "در حال ساخت سرویس نظارت..."
   cat > "$MONITOR_SCRIPT" <<'BASH'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -258,38 +291,38 @@ RestartSec=$PING_INTERVAL
 [Install]
 WantedBy=multi-user.target
 EOF
-  success "Monitor unit created."
+  success "سرویس نظارت ایجاد شد."
 }
 
 delete_all_tunnels() {
-  warn "This will remove EVERY tunnel, config & service created by this tool."
-  read -r -p "Really continue? (y/N): " confirm
-  [[ $confirm =~ ^[Yy]$ ]] || { info "Aborted."; return; }
+  warn "این عملیات تمام تونل‌ها، تنظیمات و سرویس‌های مرتبط را حذف می‌کند."
+  read -r -p "آیا مطمئن هستید؟ (y/N): " confirm
+  [[ $confirm =~ ^[Yy]$ ]] || { info "عملیات لغو شد."; return; }
 
-  systemctl stop gre-monitor.service gre-persistence.service 2>/dev/null || true
-  systemctl disable gre-monitor.service gre-persistence.service 2>/dev/null || true
-  rm -f "$MONITOR_SERVICE" "$PERSISTENCE_SERVICE" "$MONITOR_SCRIPT" "$PERSISTENCE_SCRIPT" "$CONFIG_FILE"
-  systemctl daemon-reload
+  sudo systemctl stop gre-monitor.service gre-persistence.service 2>/dev/null || true
+  sudo systemctl disable gre-monitor.service gre-persistence.service 2>/dev/null || true
+  sudo rm -f "$MONITOR_SERVICE" "$PERSISTENCE_SERVICE" "$MONITOR_SCRIPT" "$PERSISTENCE_SCRIPT" "$CONFIG_FILE"
+  sudo systemctl daemon-reload
 
   ip -o link show type gre | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r tun; do
-    [[ -n $tun ]] && ip link delete "$tun" && echo "  - $tun removed."
+    [[ -n $tun ]] && sudo ip link delete "$tun" && echo "  - $tun حذف شد."
   done
 
-  success "Cleanup complete."
+  success "پاکسازی کامل شد."
 }
 
 main_menu() {
   clear
   echo "--------- GRE Tunnel Manager ---------"
-  echo " 1) Create / Reconfigure tunnels"
-  echo " 2) Delete ALL tunnels & services"
-  echo " 3) Exit"
-  read -r -p "Select an option: " choice
+  echo " 1) ساخت / تنظیم مجدد تونل‌ها"
+  echo " 2) حذف تمام تونل‌ها و سرویس‌ها"
+  echo " 3) خروج"
+  read -r -p "گزینه را انتخاب کنید: " choice
   case $choice in
     1) create_new_tunnels ;;
     2) delete_all_tunnels ;;
     3) exit 0 ;;
-    *) error "Invalid choice."; exit 1 ;;
+    *) error "گزینه نامعتبر."; exit 1 ;;
   esac
 }
 
