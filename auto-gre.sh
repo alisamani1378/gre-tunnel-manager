@@ -163,9 +163,10 @@ create_new_tunnels() {
               read -r -p "  Port to forward (e.g., 8080): " PORT
               read -r -p "  Protocol (tcp/udp): " PROTOCOL
 
-              DEST_IP=$(echo "${INTERNAL_TUNNEL_IPS[$i]}" | cut -d'/' -f1)
-              SOURCE_IP_BASE=$(echo "$DEST_IP" | cut -d'.' -f1-3)
-              SOURCE_IP="${SOURCE_IP_BASE}.${LOCAL_IP_SUFFIX}"
+              # Define source and destination IPs for the forwarding rules
+              SUBNET_BASE=$(echo "${INTERNAL_TUNNEL_IPS[$i]}" | cut -d'/' -f1 | cut -d'.' -f1-3)
+              SOURCE_IP="${SUBNET_BASE}.${LOCAL_IP_SUFFIX}" # This server's tunnel IP (e.g., 10.0.0.1)
+              DEST_IP="${SUBNET_BASE}.${GATEWAY_IP_SUFFIX}"   # The remote server's tunnel IP (e.g., 10.0.0.2)
               
               PREROUTING_RULE="iptables -t nat -A PREROUTING -p $PROTOCOL --dport $PORT -j DNAT --to-destination ${DEST_IP}:${PORT}"
               POSTROUTING_RULE="iptables -t nat -A POSTROUTING -p $PROTOCOL -d $DEST_IP --dport $PORT -j SNAT --to-source $SOURCE_IP"
