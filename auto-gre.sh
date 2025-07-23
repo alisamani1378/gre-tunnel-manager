@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ------------------------------------------------------------------
-#  Universal GRE Tunnel Manager (Refactored)
+#  Universal GRE Tunnel Manager & Server Optimizer
 #  Author  : Ali Samani – 2025
 #  License : MIT
 # ------------------------------------------------------------------
@@ -58,18 +58,18 @@ create_new_tunnels() {
 
   # 1️⃣ Location
   local location_choice
-  location_choice=$(prompt_default "مکان سرور را انتخاب کنید (1=ایران, 2=خارج)" "2")
+  location_choice=$(prompt_default "Choose server location (1=Iran, 2=Abroad)" "2")
   case $location_choice in
     1) LOCAL_IP_SUFFIX=1; GATEWAY_IP_SUFFIX=2 ;;
     2) LOCAL_IP_SUFFIX=2; GATEWAY_IP_SUFFIX=1 ;;
-    *) warn "انتخاب نامعتبر. پیش‌فرض خارج در نظر گرفته شد."; LOCAL_IP_SUFFIX=2; GATEWAY_IP_SUFFIX=1 ;;
+    *) warn "Invalid choice. Defaulting to Abroad."; LOCAL_IP_SUFFIX=2; GATEWAY_IP_SUFFIX=1 ;;
   esac
-  success "مکان سرور تنظیم شد. IP داخلی با .$LOCAL_IP_SUFFIX پایان می‌یابد"
+  success "Server location set. Internal IPs will end with .$LOCAL_IP_SUFFIX"
 
   # 2️⃣ Delete existing tunnels / flush FW?
   local delete_choice flush_choice
-  delete_choice=$(prompt_default "تونل‌های GRE قبلی حذف شوند؟ (1=بله, 2=خیر)" "1")
-  flush_choice=$(prompt_default "تمام قوانین فایروال پاک شوند؟ (1=بله, 2=خیر)" "1")
+  delete_choice=$(prompt_default "Delete existing GRE tunnels first? (1=Yes, 2=No)" "1")
+  flush_choice=$(prompt_default "Flush ALL firewall rules? (1=Yes, 2=No)" "1")
 
   # 3️⃣ Select network interface
   mapfile -t INTERFACES < <(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -v "lo")
@@ -79,58 +79,58 @@ create_new_tunnels() {
 
   local iface_choice MAIN_INTERFACE
   while true; do
-    iface_choice=$(prompt_default "اینترفیس اصلی شبکه را انتخاب کنید" "1")
+    iface_choice=$(prompt_default "Select main network interface" "1")
     if [[ "$iface_choice" =~ ^[0-9]+$ ]] && ((iface_choice>=1 && iface_choice<=${#INTERFACES[@]})); then
       MAIN_INTERFACE=${INTERFACES[$((iface_choice-1))]}
       break
-    else warn "گزینه نامعتبر است. دوباره تلاش کنید."; fi
+    else warn "Invalid option. Try again."; fi
   done
-  success "اینترفیس '$MAIN_INTERFACE' انتخاب شد."
+  success "Interface '$MAIN_INTERFACE' selected."
 
   # 4️⃣ Enter remote IPs
-  info "IP سرورهای مقصد را وارد کنید (برای پایان خط خالی):"
+  info "Enter destination server IPs (blank line to finish):"
   REMOTE_IPS=()
   while :; do
-    read -r -p "IP ریموت: " ip
+    read -r -p "Remote IP: " ip
     [[ -z $ip ]] && break
-    if is_valid_ip "$ip"; then REMOTE_IPS+=("$ip"); else warn "IP نامعتبر، نادیده گرفته شد."; fi
+    if is_valid_ip "$ip"; then REMOTE_IPS+=("$ip"); else warn "Invalid IP, ignored."; fi
   done
-  (( ${#REMOTE_IPS[@]} )) || { error "هیچ IP معتبری وارد نشد."; return; }
+  (( ${#REMOTE_IPS[@]} )) || { error "No valid IPs supplied."; return; }
 
   # 5️⃣ Internal IP mode
   local mode_choice TUNNEL_IP_MODE
-  mode_choice=$(prompt_default "نحوه تخصیص IP داخلی (1=خودکار, 2=دستی)" "1")
+  mode_choice=$(prompt_default "Assign internal IPs (1=auto, 2=manual)" "1")
   TUNNEL_IP_MODE=$([[ $mode_choice == 2 ]] && echo "manual" || echo "auto")
-  success "حالت تخصیص IP داخلی: $TUNNEL_IP_MODE"
+  success "Internal IP assignment mode: $TUNNEL_IP_MODE"
 
   # ---------- Cleanup (optional) ----------------
   if [[ $delete_choice != 2 ]]; then
-    info "در حال حذف تونل‌های GRE موجود..."
+    info "Deleting existing GRE tunnels..."
     ip -o link show type gre | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r tun; do
-      [[ -n $tun ]] && sudo ip link delete "$tun" && echo "  - $tun حذف شد."
+      [[ -n $tun ]] && sudo ip link delete "$tun" && echo "  - $tun removed."
     done
   fi
 
   if [[ $flush_choice != 2 ]]; then
-    info "در حال پاکسازی قوانین iptables..."
+    info "Flushing iptables rules..."
     sudo iptables -F; sudo iptables -t nat -F; sudo iptables -t mangle -F
     sudo iptables -X; sudo iptables -t nat -X; sudo iptables -t mangle -X
   fi
 
   # ---------- Basic net config ---------------
-  info "در حال فعال‌سازی IP forwarding و NAT..."
+  info "Enabling IP forwarding and NAT..."
   sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
   sudo iptables -t nat -C POSTROUTING -o "$MAIN_INTERFACE" -j MASQUERADE 2>/dev/null \
     || sudo iptables -t nat -A POSTROUTING -o "$MAIN_INTERFACE" -j MASQUERADE
-  success "IP forwarding و NAT تنظیم شد."
+  success "IP forwarding & NAT configured."
 
   LOCAL_IP=$(curl -4 -s icanhazip.com || true)
-  [[ -z $LOCAL_IP ]] && { error "شناسایی IP پابلیک ممکن نبود"; exit 1; }
-  success "IP پابلیک شناسایی شد: $LOCAL_IP"
+  [[ -z $LOCAL_IP ]] && { error "Couldn't auto-detect public IP"; exit 1; }
+  success "Public IP detected: $LOCAL_IP"
 
   # ---------- Create tunnels -----------------
   INTERNAL_TUNNEL_IPS=()
-  info "در حال ساخت تونل‌ها..."
+  info "Creating tunnels..."
   for idx in "${!REMOTE_IPS[@]}"; do
     local REMOTE="${REMOTE_IPS[$idx]}"
     local TUN="gre$((idx+1))"
@@ -138,8 +138,8 @@ create_new_tunnels() {
     local TUN_IP
 
     if [[ $TUNNEL_IP_MODE == manual ]]; then
-      read -r -p "IP داخلی برای تونل $TUN → $REMOTE (مثال: ${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/24): " TUN_IP
-      is_valid_ip "${TUN_IP%%/*}" || { warn "IP نامعتبر، از حالت خودکار استفاده می‌شود."; TUN_IP="${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/24"; }
+      read -r -p "Internal IP for tunnel $TUN → $REMOTE (e.g. ${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/24): " TUN_IP
+      is_valid_ip "${TUN_IP%%/*}" || { warn "Invalid IP, using auto."; TUN_IP="${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/24"; }
     else
       TUN_IP="${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/24"
     fi
@@ -151,17 +151,17 @@ create_new_tunnels() {
     echo "  • $TUN ↔ $REMOTE  [$TUN_IP]"
   done
 
-  # ---------- Port Forwarding Setup (New) ----------------
+  # ---------- Port Forwarding Setup ----------------
   declare -a FORWARDING_RULES
   if [[ "$location_choice" == "1" ]]; then
-      info "------------- تنظیمات Port Forwarding -------------"
+      info "------------- Port Forwarding Setup -------------"
       for i in "${!REMOTE_IPS[@]}"; do
           while true; do
-              read -r -p "برای تونل به مقصد ${REMOTE_IPS[$i]} قانون Port Forwarding اضافه شود؟ (y/n): " add_forward
+              read -r -p "Add port forwarding for tunnel to ${REMOTE_IPS[$i]}? (y/n): " add_forward
               [[ $add_forward =~ ^[Yy]$ ]] || break
 
-              read -r -p "  پورت مورد نظر برای فوروارد (مثال: 8080): " PORT
-              read -r -p "  پروتکل (tcp/udp): " PROTOCOL
+              read -r -p "  Port to forward (e.g., 8080): " PORT
+              read -r -p "  Protocol (tcp/udp): " PROTOCOL
 
               DEST_IP=$(echo "${INTERNAL_TUNNEL_IPS[$i]}" | cut -d'/' -f1)
               SOURCE_IP_BASE=$(echo "$DEST_IP" | cut -d'.' -f1-3)
@@ -170,19 +170,19 @@ create_new_tunnels() {
               PREROUTING_RULE="iptables -t nat -A PREROUTING -p $PROTOCOL --dport $PORT -j DNAT --to-destination ${DEST_IP}:${PORT}"
               POSTROUTING_RULE="iptables -t nat -A POSTROUTING -p $PROTOCOL -d $DEST_IP --dport $PORT -j SNAT --to-source $SOURCE_IP"
               
-              info "  در حال اعمال قانون: $PREROUTING_RULE"
+              info "  Applying rule: $PREROUTING_RULE"
               eval "$PREROUTING_RULE"
-              info "  در حال اعمال قانون: $POSTROUTING_RULE"
+              info "  Applying rule: $POSTROUTING_RULE"
               eval "$POSTROUTING_RULE"
 
               FORWARDING_RULES+=("$PREROUTING_RULE" "$POSTROUTING_RULE")
-              success "قانون فوروارد برای پورت $PORT/$PROTOCOL اضافه شد."
+              success "Forwarding rule for port $PORT/$PROTOCOL added."
           done
       done
   fi
   
   # ---------- Save config ---------------
-  info "در حال ذخیره تنظیمات → $CONFIG_FILE"
+  info "Saving configuration → $CONFIG_FILE"
   {
     echo "MAIN_INTERFACE=\"$MAIN_INTERFACE\""
     echo "LOCAL_IP=\"$LOCAL_IP\""
@@ -190,26 +190,27 @@ create_new_tunnels() {
     echo "GATEWAY_IP_SUFFIX=$GATEWAY_IP_SUFFIX"
     echo "REMOTE_IPS=(${REMOTE_IPS[*]})"
     echo "INTERNAL_TUNNEL_IPS=(${INTERNAL_TUNNEL_IPS[*]})"
-    # Save forwarding rules safely
     printf "FORWARDING_RULES=("
     for rule in "${FORWARDING_RULES[@]}"; do printf "%q " "$rule"; done
     printf ")\n"
   } > "$CONFIG_FILE"
 
-
   # ---------- Create services ----------------
   create_persistence_service
   create_monitor_service
 
-  sudo systemctl daemon-reload
-  sudo systemctl enable --now gre-persistence.service gre-monitor.service
+  systemctl daemon-reload
+  systemctl enable --now gre-persistence.service gre-monitor.service
 
-  success "پایان یافت! زمان کل: $(( $(date +%s) - SCRIPT_START )) ثانیه"
-  info    "نیازی به ریبوت نیست، تونل‌ها فعال هستند."
+  # ---------- Final Step: Optimizer (New) ----------
+  run_optimizer
+
+  success "All done! Total time: $(( $(date +%s) - SCRIPT_START )) s"
+  info    "Reboot may be needed for kernel optimizations to take full effect."
 }
 
 create_persistence_service() {
-  info "در حال ساخت سرویس پایداری..."
+  info "Building persistence service..."
   cat > "$PERSISTENCE_SCRIPT" <<'BASH'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -248,11 +249,11 @@ ExecStart=$PERSISTENCE_SCRIPT
 [Install]
 WantedBy=multi-user.target
 EOF
-  success "سرویس پایداری ایجاد شد."
+  success "Persistence unit created."
 }
 
 create_monitor_service() {
-  info "در حال ساخت سرویس نظارت..."
+  info "Building monitor service..."
   cat > "$MONITOR_SCRIPT" <<'BASH'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -291,38 +292,167 @@ RestartSec=$PING_INTERVAL
 [Install]
 WantedBy=multi-user.target
 EOF
-  success "سرویس نظارت ایجاد شد."
+  success "Monitor unit created."
 }
 
-delete_all_tunnels() {
-  warn "این عملیات تمام تونل‌ها، تنظیمات و سرویس‌های مرتبط را حذف می‌کند."
-  read -r -p "آیا مطمئن هستید؟ (y/N): " confirm
-  [[ $confirm =~ ^[Yy]$ ]] || { info "عملیات لغو شد."; return; }
+# --- Optimizer Functions (New) ---
+apply_tcp_settings() {
+    info "Writing TCP-optimized settings..."
+    cat > /etc/sysctl.conf <<EOF
+# TCP-focused Kernel Settings (Auto-generated by script)
+vm.swappiness = 1
+vm.min_free_kbytes = 65536
+vm.dirty_ratio = 5
+vm.dirty_background_ratio = 2
+vm.vfs_cache_pressure = 50
+net.core.somaxconn = 65536
+net.core.netdev_max_backlog = 65536
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_rmem = 4096 87380 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
+net.ipv4.tcp_max_syn_backlog = 65536
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
+net.ipv4.tcp_syncookies = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+}
 
-  sudo systemctl stop gre-monitor.service gre-persistence.service 2>/dev/null || true
-  sudo systemctl disable gre-monitor.service gre-persistence.service 2>/dev/null || true
-  sudo rm -f "$MONITOR_SERVICE" "$PERSISTENCE_SERVICE" "$MONITOR_SCRIPT" "$PERSISTENCE_SCRIPT" "$CONFIG_FILE"
-  sudo systemctl daemon-reload
+apply_udp_settings() {
+    info "Writing UDP-optimized settings..."
+    cat > /etc/sysctl.conf <<EOF
+# UDP-focused Kernel Settings (Auto-generated by script)
+vm.swappiness = 1
+vm.min_free_kbytes = 65536
+vm.dirty_ratio = 5
+vm.dirty_background_ratio = 2
+vm.vfs_cache_pressure = 50
+net.core.somaxconn = 65536
+net.core.netdev_max_backlog = 65536
+net.core.rmem_default = 2097152
+net.core.wmem_default = 2097152
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.udp_mem = 2097152 4194304 8388608
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_max_syn_backlog = 65536
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
+net.ipv4.tcp_syncookies = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+}
+
+run_optimizer() {
+    info "------------- Kernel Optimization Wizard -------------"
+    read -r -p "Do you want to optimize server kernel settings now? (y/N): " optimize_confirm
+    [[ $optimize_confirm =~ ^[Yy]$ ]] || { info "Skipping kernel optimization."; return; }
+
+    echo
+    info "Please select the optimization profile:"
+    echo "  1) TCP Profile (Best for VLESS, Trojan, etc.)"
+    echo "  2) UDP Profile (Best for Gaming, WireGuard, etc.)"
+    echo
+
+    local choice
+    while true; do
+        read -p "Enter your choice [1 or 2]: " choice
+        case $choice in
+            1|2) break ;;
+            *) warn "Invalid input. Please enter 1 or 2." ;;
+        esac
+    done
+
+    echo
+    read -p "This will OVERWRITE /etc/sysctl.conf. Are you sure? [y/N]: " final_confirm
+    if [[ ! "$final_confirm" =~ ^[Yy]$ ]]; then
+        info "Operation cancelled."
+        return
+    fi
+
+    info "Backing up /etc/sysctl.conf to /etc/sysctl.conf.bak.$(date +%F)..."
+    cp /etc/sysctl.conf /etc/sysctl.conf.bak.$(date +%F)
+
+    if [ "$choice" -eq 1 ]; then
+        apply_tcp_settings
+    else
+        apply_udp_settings
+    fi
+
+    info "Applying new sysctl settings..."
+    if sysctl -p; then
+        success "Kernel settings applied."
+    else
+        error "Failed to apply kernel settings."
+    fi
+
+    echo
+    read -p "A reboot is recommended. Reboot now? [y/N]: " reboot_confirm
+    if [[ "$reboot_confirm" =~ ^[Yy]$ ]]; then
+        info "Rebooting now..."
+        reboot
+    else
+        warn "Please remember to reboot later to apply all changes."
+    fi
+}
+
+
+delete_all_tunnels() {
+  warn "This will remove EVERY tunnel, config & service created by this tool."
+  read -r -p "Really continue? (y/N): " confirm
+  [[ $confirm =~ ^[Yy]$ ]] || { info "Aborted."; return; }
+
+  systemctl stop gre-monitor.service gre-persistence.service 2>/dev/null || true
+  systemctl disable gre-monitor.service gre-persistence.service 2>/dev/null || true
+  rm -f "$MONITOR_SERVICE" "$PERSISTENCE_SERVICE" "$MONITOR_SCRIPT" "$PERSISTENCE_SCRIPT" "$CONFIG_FILE"
+  systemctl daemon-reload
 
   ip -o link show type gre | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r tun; do
-    [[ -n $tun ]] && sudo ip link delete "$tun" && echo "  - $tun حذف شد."
+    [[ -n $tun ]] && ip link delete "$tun" && echo "  - $tun removed."
   done
-
-  success "پاکسازی کامل شد."
+  
+  warn "Note: Kernel settings in /etc/sysctl.conf have NOT been reverted."
+  warn "Original backups are stored as /etc/sysctl.conf.bak.YYYY-MM-DD"
+  success "Cleanup complete."
 }
 
 main_menu() {
   clear
   echo "--------- GRE Tunnel Manager ---------"
-  echo " 1) ساخت / تنظیم مجدد تونل‌ها"
-  echo " 2) حذف تمام تونل‌ها و سرویس‌ها"
-  echo " 3) خروج"
-  read -r -p "گزینه را انتخاب کنید: " choice
+  echo " 1) Create / Reconfigure tunnels"
+  echo " 2) Delete ALL tunnels & services"
+  echo " 3) Exit"
+  read -r -p "Select an option: " choice
   case $choice in
     1) create_new_tunnels ;;
     2) delete_all_tunnels ;;
     3) exit 0 ;;
-    *) error "گزینه نامعتبر."; exit 1 ;;
+    *) error "Invalid choice."; exit 1 ;;
   esac
 }
 
