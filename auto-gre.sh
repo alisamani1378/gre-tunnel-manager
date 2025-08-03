@@ -51,7 +51,6 @@ prompt_default() { # $1=question  $2=default
   echo "${ans:-$2}"
 }
 
-# ---------- Core functions ----------------------------------------------------
 create_new_tunnels() {
   clear
   info "------------- GRE Tunnel Configuration Wizard -------------"
@@ -118,11 +117,8 @@ create_new_tunnels() {
   fi
 
   # ---------- Basic net config ---------------
-  info "Enabling IP forwarding and NAT..."
+  info "Enabling IP forwarding..."
   sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
-  sudo iptables -t nat -C POSTROUTING -o "$MAIN_INTERFACE" -j MASQUERADE 2>/dev/null \
-    || sudo iptables -t nat -A POSTROUTING -o "$MAIN_INTERFACE" -j MASQUERADE
-  success "IP forwarding & NAT configured."
 
   LOCAL_IP=$(curl -4 -s icanhazip.com || true)
   [[ -z $LOCAL_IP ]] && { error "Couldn't auto-detect public IP"; exit 1; }
@@ -151,6 +147,27 @@ create_new_tunnels() {
     echo "  • $TUN ↔ $REMOTE  [$TUN_IP]"
   done
 
+  # ---------- Configure NAT based on location (MODIFIED) ----------
+  info "Configuring NAT..."
+  declare -a MASQUERADE_RULES
+  if [[ "$location_choice" == "1" ]]; then
+    # Iran server: Masquerade on each GRE tunnel
+    for i in "${!REMOTE_IPS[@]}"; do
+      TUN="gre$((i+1))"
+      rule="iptables -t nat -A POSTROUTING -o $TUN -j MASQUERADE"
+      MASQUERADE_RULES+=("$rule")
+      # Check if rule exists, otherwise add it
+      sudo iptables -t nat -C POSTROUTING -o "$TUN" -j MASQUERADE 2>/dev/null || eval "$rule"
+    done
+    success "NAT configured on all GRE tunnels."
+  else
+    # Abroad server: Masquerade on main interface
+    rule="iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE"
+    MASQUERADE_RULES+=("$rule")
+    sudo iptables -t nat -C POSTROUTING -o "$MAIN_INTERFACE" -j MASQUERADE 2>/dev/null || eval "$rule"
+    success "NAT configured on main interface '$MAIN_INTERFACE'."
+  fi
+
   # ---------- Port Forwarding Setup ----------------
   declare -a FORWARDING_RULES
   if [[ "$location_choice" == "1" ]]; then
@@ -163,14 +180,13 @@ create_new_tunnels() {
               read -r -p "  Port to forward (e.g., 8080): " PORT
               read -r -p "  Protocol (tcp/udp): " PROTOCOL
 
-              # Define source and destination IPs for the forwarding rules
               SUBNET_BASE=$(echo "${INTERNAL_TUNNEL_IPS[$i]}" | cut -d'/' -f1 | cut -d'.' -f1-3)
-              SOURCE_IP="${SUBNET_BASE}.${LOCAL_IP_SUFFIX}" # This server's tunnel IP (e.g., 10.0.0.1)
-              DEST_IP="${SUBNET_BASE}.${GATEWAY_IP_SUFFIX}"   # The remote server's tunnel IP (e.g., 10.0.0.2)
-              
+              SOURCE_IP="${SUBNET_BASE}.${LOCAL_IP_SUFFIX}"
+              DEST_IP="${SUBNET_BASE}.${GATEWAY_IP_SUFFIX}"
+
               PREROUTING_RULE="iptables -t nat -A PREROUTING -p $PROTOCOL --dport $PORT -j DNAT --to-destination ${DEST_IP}:${PORT}"
               POSTROUTING_RULE="iptables -t nat -A POSTROUTING -p $PROTOCOL -d $DEST_IP --dport $PORT -j SNAT --to-source $SOURCE_IP"
-              
+
               info "  Applying rule: $PREROUTING_RULE"
               eval "$PREROUTING_RULE"
               info "  Applying rule: $POSTROUTING_RULE"
@@ -182,7 +198,7 @@ create_new_tunnels() {
       done
   fi
   
-  # ---------- Save config ---------------
+  # ---------- Save config (MODIFIED) ---------------
   info "Saving configuration → $CONFIG_FILE"
   {
     echo "MAIN_INTERFACE=\"$MAIN_INTERFACE\""
@@ -191,6 +207,11 @@ create_new_tunnels() {
     echo "GATEWAY_IP_SUFFIX=$GATEWAY_IP_SUFFIX"
     echo "REMOTE_IPS=(${REMOTE_IPS[*]})"
     echo "INTERNAL_TUNNEL_IPS=(${INTERNAL_TUNNEL_IPS[*]})"
+    # Save the masquerade rules
+    printf "MASQUERADE_RULES=("
+    for rule in "${MASQUERADE_RULES[@]}"; do printf "%q " "$rule"; done
+    printf ")\n"
+    # Save the port forwarding rules
     printf "FORWARDING_RULES=("
     for rule in "${FORWARDING_RULES[@]}"; do printf "%q " "$rule"; done
     printf ")\n"
@@ -209,7 +230,6 @@ create_new_tunnels() {
   success "All done! Total time: $(( $(date +%s) - SCRIPT_START )) s"
   info    "Reboot may be needed for kernel optimizations to take full effect."
 }
-
 create_persistence_service() {
   info "Building persistence service..."
   cat > "$PERSISTENCE_SCRIPT" <<'BASH'
@@ -219,8 +239,15 @@ set -Eeuo pipefail
 source /etc/gre-tunnels.conf
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
-iptables -t nat -C POSTROUTING -o "$MAIN_INTERFACE" -j MASQUERADE 2>/dev/null \
-  || iptables -t nat -A POSTROUTING -o "$MAIN_INTERFACE" -j MASQUERADE
+# Restore NAT/Masquerade rules (MODIFIED)
+for rule_cmd in "${MASQUERADE_RULES[@]}"; do
+  # Create a "check" version of the command by replacing -A with -C
+  check_cmd="${rule_cmd/ -A /-C }"
+  # If the check fails (rule does not exist), then run the original "add" command
+  if ! eval "$check_cmd" &>/dev/null; then
+    eval "$rule_cmd"
+  fi
+done
 
 for i in "${!REMOTE_IPS[@]}"; do
   TUN="gre$((i+1))"
@@ -231,7 +258,11 @@ done
 
 # Restore custom port forwarding rules
 for rule in "${FORWARDING_RULES[@]}"; do
-    eval "$rule"
+    # Create a "check" version of the command to avoid duplicates
+    check_cmd="${rule/-A /-C }"
+    if ! eval "$check_cmd" &>/dev/null; then
+      eval "$rule"
+    fi
 done
 BASH
   chmod +x "$PERSISTENCE_SCRIPT"
