@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # ------------------------------------------------------------------
-#  Universal GRE Tunnel Manager & Server Optimizer (Domain-aware + Hostname-only Monitor)
+#  Universal GRE Tunnel Manager & Server Optimizer (Domain-aware)
 #  Author  : Ali Samani – 2025
 #  License : MIT
+#  Notes   : - Remote endpoints can be domain or IPv4
+#            - Monitor only tracks domain endpoints (not IP)
+#            - Local server IP is detected once at boot (persistence)
 # ------------------------------------------------------------------
 
 set -Eeuo pipefail
@@ -14,8 +17,8 @@ PERSISTENCE_SCRIPT="/usr/local/bin/gre-persistence.sh"
 MONITOR_SCRIPT="/usr/local/bin/gre-monitor.sh"
 PERSISTENCE_SERVICE="/etc/systemd/system/gre-persistence.service"
 MONITOR_SERVICE="/etc/systemd/system/gre-monitor.service"
-PING_INTERVAL=10            # seconds
-MONITOR_FAIL_THRESHOLD=3     # pings
+PING_INTERVAL=10            # seconds (monitor loop interval)
+MONITOR_FAIL_THRESHOLD=3    # pings for healthcheck
 
 # ---------- Pretty print helpers ---------------------------------------------
 NC='\033[0m'
@@ -183,6 +186,7 @@ create_new_tunnels() {
     ip link show "$TUN" &>/dev/null || ip tunnel add "$TUN" mode gre remote "$RESOLVED_REMOTE" local "$LOCAL_IP" ttl 255
     ip addr show dev "$TUN" | grep -q "$TUN_IP" || ip addr add "$TUN_IP" dev "$TUN"
     ip link set "$TUN" up
+    sysctl -w "net.ipv4.conf.${TUN}.rp_filter=0" >/dev/null || true
     echo "  • $TUN ↔ $ENDPOINT ($RESOLVED_REMOTE)  [$TUN_IP]"
   done
 
@@ -285,8 +289,14 @@ set -Eeuo pipefail
 # shellcheck disable=SC1091
 source /etc/gre-tunnels.conf
 
+# Detect current server's local/public IPv4 once at boot
+detect_local_ip() {
+  ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if ($i=="src"){print $(i+1); exit}}' \
+  || ip -4 addr show scope global | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1 \
+  || curl -4 -s icanhazip.com 2>/dev/null
+}
+
 is_valid_ip() { [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
-is_valid_hostname() { [[ $1 =~ ^([a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?\.)+[A-Za-z]{2,}$ ]]; }
 resolve_remote() {
   local t="$1" ip=""
   if is_valid_ip "$t"; then echo "$t"; return 0; fi
@@ -296,7 +306,15 @@ resolve_remote() {
 
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
-# Restore NAT/Masquerade rules
+# (0) If local IP changed (e.g., snapshot), update config & use the new one
+CURRENT_LOCAL_IP="$(detect_local_ip)"
+if [[ -n "$CURRENT_LOCAL_IP" && "$CURRENT_LOCAL_IP" != "$LOCAL_IP" ]]; then
+  echo "[INFO] LOCAL_IP changed: $LOCAL_IP -> $CURRENT_LOCAL_IP (updating config & tunnels)"
+  sed -i -E 's|^LOCAL_IP="[^"]*"|LOCAL_IP="'"$CURRENT_LOCAL_IP"'"|' /etc/gre-tunnels.conf || true
+  LOCAL_IP="$CURRENT_LOCAL_IP"
+fi
+
+# Restore NAT/Masquerade rules (idempotent)
 for rule_cmd in "${MASQUERADE_RULES[@]}"; do
   check_cmd="${rule_cmd/ -A /-C }"
   if ! eval "$check_cmd" &>/dev/null; then eval "$rule_cmd"; fi
@@ -309,16 +327,12 @@ for i in "${!REMOTE_ENDPOINTS[@]}"; do
   RESOLVED="$(resolve_remote "$ENDPOINT" || true)"
   [[ -z "$RESOLVED" ]] && { echo "WARN: cannot resolve $ENDPOINT"; continue; }
 
-  ip link show "$TUN" &>/dev/null || ip tunnel add "$TUN" mode gre remote "$RESOLVED" local "$LOCAL_IP" ttl 255
-
-  CUR_REMOTE="$(ip -d tunnel show "$TUN" 2>/dev/null | awk '/remote/ {print $4; exit}')"
-  if [[ "$CUR_REMOTE" != "$RESOLVED" && -n "$CUR_REMOTE" ]]; then
-    ip link set "$TUN" down || true
-    ip tunnel change "$TUN" remote "$RESOLVED" local "$LOCAL_IP" ttl 255
-  fi
-
-  ip addr show dev "$TUN" | grep -q "${INTERNAL_TUNNEL_IPS[$i]}" || ip addr add "${INTERNAL_TUNNEL_IPS[$i]}" dev "$TUN"
+  ip link set "$TUN" down 2>/dev/null || true
+  ip tunnel del "$TUN" 2>/dev/null || true
+  ip tunnel add "$TUN" mode gre remote "$RESOLVED" local "$LOCAL_IP" ttl 255
+  ip addr add "${INTERNAL_TUNNEL_IPS[$i]}" dev "$TUN" 2>/dev/null || true
   ip link set "$TUN" up
+  sysctl -w "net.ipv4.conf.${TUN}.rp_filter=0" >/dev/null || true
 done
 
 # Restore custom port forwarding rules
@@ -331,7 +345,7 @@ BASH
 
   cat > "$PERSISTENCE_SERVICE" <<EOF
 [Unit]
-Description=Restore GRE tunnels at boot (domain-aware)
+Description=Restore GRE tunnels at boot (domain-aware; detect local IP once)
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=$CONFIG_FILE
@@ -358,14 +372,12 @@ INTERVAL=${PING_INTERVAL:-10}
 THRESHOLD=${MONITOR_FAIL_THRESHOLD:-3}
 
 is_valid_ip() { [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
-is_valid_hostname() { [[ $1 =~ ^([a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?\.)+[A-Za-z]{2,}$ ]]; }
 resolve_remote() {
   local t="$1" ip=""
   if is_valid_ip "$t"; then echo "$t"; return 0; fi
   ip=$(getent ahostsv4 "$t" | awk '{print $1; exit}') || true
   [[ -n $ip ]] && echo "$ip" || return 1
 }
-
 ensure_addr_up() { # $1=tun $2=cidr
   ip addr show dev "$1" | grep -q " ${2//\//\\/} " || ip addr add "$2" dev "$1"
   ip link set "$1" up || true
@@ -377,25 +389,25 @@ while true; do
     ENDPOINT="${REMOTE_ENDPOINTS[$i]}"
     CIDR="${INTERNAL_TUNNEL_IPS[$i]}"
 
-    # --- فقط دامنه‌ها مانیتور می‌شوند؛ اگر IP است، صرفاً اطمینان از up بودن ---
+    # (A) If endpoint is IP -> no DNS monitor; just keep link/address up
     if is_valid_ip "$ENDPOINT"; then
       ensure_addr_up "$TUN" "$CIDR"
       continue
     fi
 
-    # --- دامنه: هر بار Resolve و اگر IP تغییر کرده، تونل حذف و دوباره ساخته شود ---
+    # (B) Endpoint is domain -> resolve periodically; if changed, rebuild tunnel
     NEW_REMOTE="$(resolve_remote "$ENDPOINT" || true)"
     CUR_REMOTE="$(ip -d tunnel show "$TUN" 2>/dev/null | awk '/remote/ {print $4; exit}')"
-
     if [[ -n "$NEW_REMOTE" && "$NEW_REMOTE" != "$CUR_REMOTE" ]]; then
       ip link set "$TUN" down 2>/dev/null || true
       ip tunnel del "$TUN" 2>/dev/null || true
       ip tunnel add "$TUN" mode gre remote "$NEW_REMOTE" local "$LOCAL_IP" ttl 255
       ensure_addr_up "$TUN" "$CIDR"
+      sysctl -w "net.ipv4.conf.${TUN}.rp_filter=0" >/dev/null || true
       continue
     fi
 
-    # Health check inside tunnel (optional ping to internal GW)
+    # (C) Optional health check to internal GW
     SUBNET="$(echo "$CIDR" | cut -d'/' -f1 | cut -d'.' -f1-3)"
     GW="${SUBNET}.${GATEWAY_IP_SUFFIX}"
     if ! ping -c "$THRESHOLD" -W 2 "$GW" &>/dev/null; then
@@ -410,7 +422,7 @@ BASH
 
   cat > "$MONITOR_SERVICE" <<EOF
 [Unit]
-Description=Keep GRE tunnels alive (hostname-only DNS monitor)
+Description=Keep GRE tunnels alive (DNS monitor for hostnames only)
 After=gre-persistence.service
 Wants=gre-persistence.service
 ConditionPathExists=$CONFIG_FILE
