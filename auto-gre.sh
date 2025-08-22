@@ -215,28 +215,36 @@ create_new_tunnels() {
   if [[ "$location_choice" == "1" ]]; then
     info "------------- Port Forwarding Setup -------------"
     for i in "${!REMOTE_ENDPOINTS[@]}"; do
-      while true; do
-        read -r -p "Add port forwarding for tunnel to ${REMOTE_ENDPOINTS[$i]}? (y/n): " add_forward
-        [[ $add_forward =~ ^[Yy]$ ]] || break
+while true; do
+    read -r -p "Add port forwarding for tunnel to ${REMOTE_ENDPOINTS[$i]}? (y/n): " add_forward
+    [[ $add_forward =~ ^[Yy]$ ]] || break
 
-        read -r -p "  Port to forward (e.g., 8080): " PORT
-        read -r -p "  Protocol (tcp/udp): " PROTOCOL
+    read -r -p "  Port to forward (e.g., 8080 or 8080=7070): " PORT_INPUT
+    if [[ "$PORT_INPUT" == *"="* ]]; then
+        SRC_PORT="${PORT_INPUT%%=*}"
+        DST_PORT="${PORT_INPUT##*=}"
+    else
+        SRC_PORT="$PORT_INPUT"
+        DST_PORT="$PORT_INPUT"
+    fi
+    read -r -p "  Protocol (tcp/udp): " PROTOCOL
 
-        SUBNET_BASE=$(echo "${INTERNAL_TUNNEL_IPS[$i]}" | cut -d'/' -f1 | cut -d'.' -f1-3)
-        SOURCE_IP="${SUBNET_BASE}.${LOCAL_IP_SUFFIX}"
-        DEST_IP="${SUBNET_BASE}.${GATEWAY_IP_SUFFIX}"
+    SUBNET_BASE=$(echo "${INTERNAL_TUNNEL_IPS[$i]}" | cut -d'/' -f1 | cut -d'.' -f1-3)
+    SOURCE_IP="${SUBNET_BASE}.${LOCAL_IP_SUFFIX}"
+    DEST_IP="${SUBNET_BASE}.${GATEWAY_IP_SUFFIX}"
 
-        PREROUTING_RULE="iptables -t nat -A PREROUTING -p $PROTOCOL --dport $PORT -j DNAT --to-destination ${DEST_IP}:${PORT}"
-        POSTROUTING_RULE="iptables -t nat -A POSTROUTING -p $PROTOCOL -d $DEST_IP --dport $PORT -j SNAT --to-source $SOURCE_IP"
+    PREROUTING_RULE="iptables -t nat -A PREROUTING -p $PROTOCOL --dport $SRC_PORT -j DNAT --to-destination ${DEST_IP}:${DST_PORT}"
+    POSTROUTING_RULE="iptables -t nat -A POSTROUTING -p $PROTOCOL -d $DEST_IP --dport $DST_PORT -j SNAT --to-source $SOURCE_IP"
 
-        info "  Applying rule: $PREROUTING_RULE"
-        eval "$PREROUTING_RULE"
-        info "  Applying rule: $POSTROUTING_RULE"
-        eval "$POSTROUTING_RULE"
+    info "  Applying rule: $PREROUTING_RULE"
+    eval "$PREROUTING_RULE"
+    info "  Applying rule: $POSTROUTING_RULE"
+    eval "$POSTROUTING_RULE"
 
-        FORWARDING_RULES+=("$PREROUTING_RULE" "$POSTROUTING_RULE")
-        success "Forwarding rule for port $PORT/$PROTOCOL added."
-      done
+    FORWARDING_RULES+=("$PREROUTING_RULE" "$POSTROUTING_RULE")
+    success "Forwarding rule added: $SRC_PORT → $DST_PORT/$PROTOCOL"
+done
+
     done
   fi
 
