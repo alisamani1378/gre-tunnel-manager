@@ -376,16 +376,37 @@ set -Eeuo pipefail
 [[ -f /etc/gre-tunnels.conf ]] || exit 0
 # shellcheck disable=SC1091
 source /etc/gre-tunnels.conf
+
 INTERVAL=${PING_INTERVAL:-10}
 THRESHOLD=${MONITOR_FAIL_THRESHOLD:-3}
 
 is_valid_ip() { [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+
+# hostname -> IPv4
 resolve_remote() {
   local t="$1" ip=""
   if is_valid_ip "$t"; then echo "$t"; return 0; fi
   ip=$(getent ahostsv4 "$t" | awk '{print $1; exit}') || true
   [[ -n $ip ]] && echo "$ip" || return 1
 }
+
+# اگر تونل وجود نداشت، با endpoint و LOCAL_IP بسازش و بالا بیار
+ensure_tun_present() { # $1=tun $2=endpoint $3=cidr
+  local tun="$1" ep="$2" cidr="$3" remote=""
+  if ip link show "$tun" &>/dev/null; then
+    return 0
+  fi
+  remote="$(resolve_remote "$ep" || true)"
+  [[ -z "$remote" ]] && { echo "[MONITOR] WARN: cannot resolve $ep to create $tun"; return 1; }
+  ip tunnel add "$tun" mode gre remote "$remote" local "$LOCAL_IP" ttl 255 || return 1
+  ip addr add "$cidr" dev "$tun" 2>/dev/null || true
+  ip link set "$tun" up || true
+  sysctl -w "net.ipv4.conf.${tun}.rp_filter=0" >/dev/null || true
+  echo "[MONITOR] recreated $tun → remote=$remote cidr=$cidr"
+  return 0
+}
+
+# مطمئن شو آدرس داخلی هست و لینک up است
 ensure_addr_up() { # $1=tun $2=cidr
   ip addr show dev "$1" | grep -q " ${2//\//\\/} " || ip addr add "$2" dev "$1"
   ip link set "$1" up || true
@@ -394,43 +415,57 @@ ensure_addr_up() { # $1=tun $2=cidr
 while true; do
   for i in "${!REMOTE_ENDPOINTS[@]}"; do
     TUN="gre$((i+1))"
-    ENDPOINT="${REMOTE_ENDPOINTS[$i]}"
+    EP="${REMOTE_ENDPOINTS[$i]}"
     CIDR="${INTERNAL_TUNNEL_IPS[$i]}"
 
-    # (A) If endpoint is IP -> no DNS monitor; just keep link/address up
-    if is_valid_ip "$ENDPOINT"; then
-      ensure_addr_up "$TUN" "$CIDR"
-      continue
+    # 0) اگر تونل نیست، بساز
+    ensure_tun_present "$TUN" "$EP" "$CIDR" || { sleep "$INTERVAL"; continue; }
+
+    # 1) ensure link & address
+    ensure_addr_up "$TUN" "$CIDR"
+
+    # 2) DNS-monitor: فقط برای دامنه‌ها → اگر IP عوض شد، rebuild
+    if ! is_valid_ip "$EP"; then
+      NEW_REMOTE="$(resolve_remote "$EP" || true)"
+      CUR_REMOTE="$(ip -d tunnel show "$TUN" 2>/dev/null | awk '/remote/ {print $4; exit}')"
+      if [[ -n "$NEW_REMOTE" && "$NEW_REMOTE" != "$CUR_REMOTE" ]]; then
+        echo "[MONITOR] $TUN remote changed for $EP: $CUR_REMOTE -> $NEW_REMOTE (rebuild)"
+        ip link set "$TUN" down 2>/dev/null || true
+        ip tunnel del "$TUN" 2>/dev/null || true
+        ip tunnel add "$TUN" mode gre remote "$NEW_REMOTE" local "$LOCAL_IP" ttl 255
+        ensure_addr_up "$TUN" "$CIDR"
+        sysctl -w "net.ipv4.conf.${TUN}.rp_filter=0" >/dev/null || true
+      fi
     fi
 
-    # (B) Endpoint is domain -> resolve periodically; if changed, rebuild tunnel
-    NEW_REMOTE="$(resolve_remote "$ENDPOINT" || true)"
-    CUR_REMOTE="$(ip -d tunnel show "$TUN" 2>/dev/null | awk '/remote/ {print $4; exit}')"
-    if [[ -n "$NEW_REMOTE" && "$NEW_REMOTE" != "$CUR_REMOTE" ]]; then
+    # 3) Health-monitor: پینگ به IP داخلی طرف مقابل (برای همه‌ی تونل‌ها)
+    LOCAL_INNER="${CIDR%%/*}"                 # مثل 20.0.0.2
+    BASE="$(echo "$LOCAL_INNER" | cut -d'.' -f1-3)"
+    HOST="$(echo "$LOCAL_INNER" | cut -d'.' -f4)"
+    if [[ "$HOST" == "$LOCAL_IP_SUFFIX" ]]; then
+      PEER="$BASE.$GATEWAY_IP_SUFFIX"        # 20.0.0.1
+    else
+      PEER="$BASE.$LOCAL_IP_SUFFIX"          # fallback
+    fi
+
+    if ! ping -c "$THRESHOLD" -W 2 "$PEER" &>/dev/null; then
+      echo "[MONITOR] $TUN ping $PEER failed → bounce"
       ip link set "$TUN" down 2>/dev/null || true
-      ip tunnel del "$TUN" 2>/dev/null || true
-      ip tunnel add "$TUN" mode gre remote "$NEW_REMOTE" local "$LOCAL_IP" ttl 255
-      ensure_addr_up "$TUN" "$CIDR"
-      sysctl -w "net.ipv4.conf.${TUN}.rp_filter=0" >/dev/null || true
-      continue
+      ip link set "$TUN" up   2>/dev/null || true
+      # اگر تونل در bounce حذف شد، دوباره بساز
+      ip link show "$TUN" &>/dev/null || ensure_tun_present "$TUN" "$EP" "$CIDR"
+      ping -c 1 -W 2 "$PEER" &>/dev/null || echo "[MONITOR] $TUN still failing to ping $PEER"
     fi
 
-    # (C) Optional health check to internal GW
-    SUBNET="$(echo "$CIDR" | cut -d'/' -f1 | cut -d'.' -f1-3)"
-    GW="${SUBNET}.${GATEWAY_IP_SUFFIX}"
-    if ! ping -c "$THRESHOLD" -W 2 "$GW" &>/dev/null; then
-      ip link set "$TUN" down || true
-      ip link set "$TUN" up   || true
-    fi
   done
-  sleep "$INTERVAL"
+  sleep "${INTERVAL:-10}"
 done
 BASH
   chmod +x "$MONITOR_SCRIPT"
 
   cat > "$MONITOR_SERVICE" <<EOF
 [Unit]
-Description=Keep GRE tunnels alive (DNS monitor for hostnames only)
+Description=Keep GRE tunnels alive (DNS + Health ping; auto-recreate greX)
 After=gre-persistence.service
 Wants=gre-persistence.service
 ConditionPathExists=$CONFIG_FILE
@@ -438,7 +473,7 @@ ConditionPathExists=$CONFIG_FILE
 [Service]
 ExecStart=$MONITOR_SCRIPT
 Restart=always
-RestartSec=$PING_INTERVAL
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
