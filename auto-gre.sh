@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
 # ------------------------------------------------------------------
-#  Universal GRE Tunnel Manager & Server Optimizer (Domain-aware)
+#  Universal GRE Tunnel Manager (Domain-aware) + Dual Monitors
 #  Author  : Ali Samani – 2025
 #  License : MIT
-#  Notes   : - Remote endpoints can be domain or IPv4
-#            - Monitor only tracks domain endpoints (not IP)
-#            - Local server IP is detected once at boot (persistence)
 # ------------------------------------------------------------------
 
 set -Eeuo pipefail
@@ -17,76 +14,42 @@ PERSISTENCE_SCRIPT="/usr/local/bin/gre-persistence.sh"
 MONITOR_SCRIPT="/usr/local/bin/gre-monitor.sh"
 PERSISTENCE_SERVICE="/etc/systemd/system/gre-persistence.service"
 MONITOR_SERVICE="/etc/systemd/system/gre-monitor.service"
-PING_INTERVAL=10            # seconds (monitor loop interval)
-MONITOR_FAIL_THRESHOLD=3    # pings for healthcheck
+PING_INTERVAL=10            # seconds
+MONITOR_FAIL_THRESHOLD=3    # pings
 
 # ---------- Pretty print helpers ---------------------------------------------
-NC='\033[0m'
-C_BLUE='\033[0;36m'
-C_GREEN='\033[0;32m'
-C_YELLOW='\033[0;33m'
-C_RED='\033[0;31m'
-
+NC='\033[0m'; C_BLUE='\033[0;36m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_RED='\033[0;31m'
 info()    { echo -e "${C_BLUE}[INFO]${NC}    $*"; }
 success() { echo -e "${C_GREEN}[OK]${NC}      $*"; }
 warn()    { echo -e "${C_YELLOW}[WARN]${NC}   $*"; }
 error()   { echo -e "${C_RED}[ERROR]${NC}  $*" >&2; }
 
 # ---------- Root check --------------------------------------------------------
-if [[ $EUID -ne 0 ]]; then
-  error "This script must be run as root (try with sudo)."
-  exit 1
-fi
+if [[ $EUID -ne 0 ]]; then error "Run as root (sudo)."; exit 1; fi
 
 # ---------- Utils -------------------------------------------------------------
 is_valid_ip() {
   local ip=$1
   [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  IFS=. read -r o1 o2 o3 o4 <<<"$ip"
-  for o in $o1 $o2 $o3 $o4; do
-    ((o <= 255)) || return 1
-  done
+  IFS=. read -r a b c d <<<"$ip"; for o in $a $b $c $d; do ((o<=255)) || return 1; done
 }
-
-is_valid_hostname() {
-  local h=$1
-  [[ $h =~ ^([a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?\.)+[A-Za-z]{2,}$ ]]
-}
-
-resolve_remote() { # $1=hostname_or_ip -> echo IPv4 or fail
-  local target="$1" ip=""
-  if is_valid_ip "$target"; then
-    echo "$target"; return 0
-  fi
-  # Prefer libc/NSS
-  ip=$(getent ahostsv4 "$target" | awk '{print $1; exit}') || true
-  if [[ -z $ip ]]; then
-    if command -v dig >/dev/null 2>&1; then
-      ip=$(dig +short A "$target" | grep -E '^[0-9]+\.' | head -n1) || true
-    elif command -v drill >/dev/null 2>&1; then
-      ip=$(drill "$target" A | awk '/IN[ \t]+A[ \t]+/ {print $5; exit}') || true
-    elif command -v host >/dev/null 2>&1; then
-      ip=$(host -t A "$target" | awk '/ has address /{print $4; exit}') || true
-    fi
-  fi
+is_valid_hostname() { [[ $1 =~ ^([a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?\.)+[A-Za-z]{2,}$ ]]; }
+resolve_remote_once() { # hostname/ip -> one IPv4
+  local t="$1" ip=""
+  if is_valid_ip "$t"; then echo "$t"; return 0; fi
+  ip=$(getent ahostsv4 "$t" | awk '{print $1; exit}') || true
   [[ -n $ip ]] && echo "$ip" || return 1
 }
-
-prompt_default() { # $1=question  $2=default
-  local ans
-  read -r -p "$1 [$2]: " ans
-  echo "${ans:-$2}"
-}
+prompt_default(){ local a; read -r -p "$1 [$2]: " a; echo "${a:-$2}"; }
 
 # =====================================================================
 # ====================== Actions (Wizard) =============================
 # =====================================================================
-
 create_new_tunnels() {
   clear
   info "------------- GRE Tunnel Configuration Wizard -------------"
 
-  # 1) Location
+  # 1) Location (suffix ها)
   local location_choice
   location_choice=$(prompt_default "Choose server location (1=Iran, 2=Abroad)" "2")
   case $location_choice in
@@ -94,63 +57,50 @@ create_new_tunnels() {
     2) LOCAL_IP_SUFFIX=2; GATEWAY_IP_SUFFIX=1 ;;
     *) warn "Invalid choice. Defaulting to Abroad."; LOCAL_IP_SUFFIX=2; GATEWAY_IP_SUFFIX=1 ;;
   esac
-  success "Server location set. Internal IPs will end with .$LOCAL_IP_SUFFIX"
+  success "Internal IPs will end with .$LOCAL_IP_SUFFIX"
 
-  # 2) Delete existing tunnels / flush FW?
+  # 2) Cleanup
   local delete_choice flush_choice
   delete_choice=$(prompt_default "Delete existing GRE tunnels first? (1=Yes, 2=No)" "1")
   flush_choice=$(prompt_default "Flush ALL firewall rules? (1=Yes, 2=No)" "1")
 
-  # 3) Select network interface
+  # 3) Main interface
   mapfile -t INTERFACES < <(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -v "lo")
-  echo "--------------------------------------------------"
-  for i in "${!INTERFACES[@]}"; do echo " $((i+1))) ${INTERFACES[$i]}"; done
-  echo "--------------------------------------------------"
+  echo "--------------------------------------------------"; for i in "${!INTERFACES[@]}"; do echo " $((i+1))) ${INTERFACES[$i]}"; done; echo "--------------------------------------------------"
   local iface_choice MAIN_INTERFACE
   while true; do
     iface_choice=$(prompt_default "Select main network interface" "1")
     if [[ "$iface_choice" =~ ^[0-9]+$ ]] && ((iface_choice>=1 && iface_choice<=${#INTERFACES[@]})); then
-      MAIN_INTERFACE=${INTERFACES[$((iface_choice-1))]}
-      break
+      MAIN_INTERFACE=${INTERFACES[$((iface_choice-1))]}; break
     else warn "Invalid option. Try again."; fi
   done
   success "Interface '$MAIN_INTERFACE' selected."
 
-  # ---------- Cleanup (optional) ----------------
+  # Cleanup
   if [[ $delete_choice != 2 ]]; then
     info "Deleting existing GRE tunnels..."
-    ip -o link show type gre | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r tun; do
-      [[ -n $tun ]] && { ip link delete "$tun" && echo "  - $tun removed."; } || true
-    done
+    ip -o link show type gre | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r t; do [[ -n $t ]] && ip link delete "$t" && echo "  - $t removed."; done
   fi
-
   if [[ $flush_choice != 2 ]]; then
-    info "Flushing iptables rules..."
-    iptables -F; iptables -t nat -F; iptables -t mangle -F
-    iptables -X; iptables -t nat -X; iptables -t mangle -X
+    info "Flushing iptables..."; iptables -F; iptables -t nat -F; iptables -t mangle -F; iptables -X; iptables -t nat -X; iptables -t mangle -X
   fi
 
-  # ---------- Basic net config ---------------
-  info "Enabling IP forwarding..."
-  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  # Net basic
+  info "Enabling IP forwarding..."; sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
   LOCAL_IP=$(curl -4 -s icanhazip.com || true)
   [[ -z $LOCAL_IP ]] && { error "Couldn't auto-detect public IP"; exit 1; }
   success "Public IP detected: $LOCAL_IP"
 
-  # 4) Remote endpoints (domain or IP)
-  info "Enter remote server endpoints (domain or IPv4). Blank line to finish:"
+  # 4) Remote endpoints (domain/ip)
+  info "Enter remote endpoints (domain or IPv4). Blank to finish:"
   REMOTE_ENDPOINTS=()
   while :; do
     read -r -p "Remote endpoint: " ep
     [[ -z $ep ]] && break
-    if is_valid_ip "$ep" || is_valid_hostname "$ep"; then
-      REMOTE_ENDPOINTS+=("$ep")
-    else
-      warn "Invalid domain/IP, ignored."
-    fi
+    if is_valid_ip "$ep" || is_valid_hostname "$ep"; then REMOTE_ENDPOINTS+=("$ep"); else warn "Invalid endpoint, ignored."; fi
   done
-  (( ${#REMOTE_ENDPOINTS[@]} )) || { error "No valid endpoints supplied."; return; }
+  (( ${#REMOTE_ENDPOINTS[@]} )) || { error "No endpoints supplied."; return; }
 
   # 5) Internal IP mode
   local mode_choice TUNNEL_IP_MODE
@@ -158,23 +108,16 @@ create_new_tunnels() {
   TUNNEL_IP_MODE=$([[ $mode_choice == 2 ]] && echo "manual" || echo "auto")
   success "Internal IP assignment mode: $TUNNEL_IP_MODE"
 
-  # ---------- Create tunnels -----------------
-  INTERNAL_TUNNEL_IPS=()
-  RESOLVED_REMOTE_IPS=()
+  # Create tunnels
+  INTERNAL_TUNNEL_IPS=(); RESOLVED_REMOTE_IPS=()
   info "Creating tunnels..."
   for idx in "${!REMOTE_ENDPOINTS[@]}"; do
     local ENDPOINT="${REMOTE_ENDPOINTS[$idx]}"
     local RESOLVED_REMOTE
-    if ! RESOLVED_REMOTE=$(resolve_remote "$ENDPOINT"); then
-      error "Cannot resolve $ENDPOINT — skipping."
-      continue
-    fi
+    if ! RESOLVED_REMOTE=$(resolve_remote_once "$ENDPOINT"); then warn "Cannot resolve $ENDPOINT — skipping."; continue; fi
     RESOLVED_REMOTE_IPS+=("$RESOLVED_REMOTE")
 
-    local TUN="gre$((idx+1))"
-    local SUBNET_BASE=$(( (idx+1) * 10 ))
-    local TUN_IP
-
+    local TUN="gre$((idx+1))"; local SUBNET_BASE=$(( (idx+1) * 10 )); local TUN_IP
     if [[ $TUNNEL_IP_MODE == manual ]]; then
       read -r -p "Internal IP for $TUN → $ENDPOINT ($RESOLVED_REMOTE) (e.g. ${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/24): " TUN_IP
       is_valid_ip "${TUN_IP%%/*}" || { warn "Invalid IP, using auto."; TUN_IP="${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/24"; }
@@ -190,102 +133,76 @@ create_new_tunnels() {
     echo "  • $TUN ↔ $ENDPOINT ($RESOLVED_REMOTE)  [$TUN_IP]"
   done
 
-  # ---------- Configure NAT based on location ----------
+  # NAT
   info "Configuring NAT..."
   declare -a MASQUERADE_RULES
   if [[ "$location_choice" == "1" ]]; then
-    # Iran server: Masquerade on each GRE tunnel
     for i in "${!REMOTE_ENDPOINTS[@]}"; do
-      TUN="gre$((i+1))"
-      rule="iptables -t nat -A POSTROUTING -o $TUN -j MASQUERADE"
-      MASQUERADE_RULES+=("$rule")
-      iptables -t nat -C POSTROUTING -o "$TUN" -j MASQUERADE 2>/dev/null || eval "$rule"
+      TUN="gre$((i+1))"; rule="iptables -t nat -A POSTROUTING -o $TUN -j MASQUERADE"
+      MASQUERADE_RULES+=("$rule"); iptables -t nat -C POSTROUTING -o "$TUN" -j MASQUERADE 2>/dev/null || eval "$rule"
     done
-    success "NAT configured on all GRE tunnels."
+    success "NAT on GRE tunnels."
   else
-    # Abroad server: Masquerade on main interface
     rule="iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE"
-    MASQUERADE_RULES+=("$rule")
-    iptables -t nat -C POSTROUTING -o "$MAIN_INTERFACE" -j MASQUERADE 2>/dev/null || eval "$rule"
-    success "NAT configured on main interface '$MAIN_INTERFACE'."
+    MASQUERADE_RULES+=("$rule"); iptables -t nat -C POSTROUTING -o "$MAIN_INTERFACE" -j MASQUERADE 2>/dev/null || eval "$rule"
+    success "NAT on main interface '$MAIN_INTERFACE'."
   fi
 
-  # ---------- Port Forwarding Setup (optional) ----------
+  # Port Forward (optional, only Iran side)
   declare -a FORWARDING_RULES
   if [[ "$location_choice" == "1" ]]; then
     info "------------- Port Forwarding Setup -------------"
     for i in "${!REMOTE_ENDPOINTS[@]}"; do
-while true; do
-    read -r -p "Add port forwarding for tunnel to ${REMOTE_ENDPOINTS[$i]}? (y/n): " add_forward
-    [[ $add_forward =~ ^[Yy]$ ]] || break
+      while true; do
+        read -r -p "Add port forwarding for tunnel to ${REMOTE_ENDPOINTS[$i]}? (y/n): " add_forward
+        [[ $add_forward =~ ^[Yy]$ ]] || break
+        read -r -p "  Port (e.g., 8080 or 8080=7070): " PORT_INPUT
+        if [[ "$PORT_INPUT" == *"="* ]]; then SRC_PORT="${PORT_INPUT%%=*}"; DST_PORT="${PORT_INPUT##*=}"; else SRC_PORT="$PORT_INPUT"; DST_PORT="$PORT_INPUT"; fi
+        read -r -p "  Protocol (tcp/udp): " PROTOCOL
 
-    read -r -p "  Port to forward (e.g., 8080 or 8080=7070): " PORT_INPUT
-    if [[ "$PORT_INPUT" == *"="* ]]; then
-        SRC_PORT="${PORT_INPUT%%=*}"
-        DST_PORT="${PORT_INPUT##*=}"
-    else
-        SRC_PORT="$PORT_INPUT"
-        DST_PORT="$PORT_INPUT"
-    fi
-    read -r -p "  Protocol (tcp/udp): " PROTOCOL
+        SUBNET_BASE=$(echo "${INTERNAL_TUNNEL_IPS[$i]}" | cut -d'/' -f1 | cut -d'.' -f1-3)
+        SOURCE_IP="${SUBNET_BASE}.${LOCAL_IP_SUFFIX}"
+        DEST_IP="${SUBNET_BASE}.${GATEWAY_IP_SUFFIX}"
 
-    SUBNET_BASE=$(echo "${INTERNAL_TUNNEL_IPS[$i]}" | cut -d'/' -f1 | cut -d'.' -f1-3)
-    SOURCE_IP="${SUBNET_BASE}.${LOCAL_IP_SUFFIX}"
-    DEST_IP="${SUBNET_BASE}.${GATEWAY_IP_SUFFIX}"
-
-    PREROUTING_RULE="iptables -t nat -A PREROUTING -p $PROTOCOL --dport $SRC_PORT -j DNAT --to-destination ${DEST_IP}:${DST_PORT}"
-    POSTROUTING_RULE="iptables -t nat -A POSTROUTING -p $PROTOCOL -d $DEST_IP --dport $DST_PORT -j SNAT --to-source $SOURCE_IP"
-
-    info "  Applying rule: $PREROUTING_RULE"
-    eval "$PREROUTING_RULE"
-    info "  Applying rule: $POSTROUTING_RULE"
-    eval "$POSTROUTING_RULE"
-
-    FORWARDING_RULES+=("$PREROUTING_RULE" "$POSTROUTING_RULE")
-    success "Forwarding rule added: $SRC_PORT → $DST_PORT/$PROTOCOL"
-done
-
+        PR="iptables -t nat -A PREROUTING -p $PROTOCOL --dport $SRC_PORT -j DNAT --to-destination ${DEST_IP}:${DST_PORT}"
+        PO="iptables -t nat -A POSTROUTING -p $PROTOCOL -d $DEST_IP --dport $DST_PORT -j SNAT --to-source $SOURCE_IP"
+        info "  Applying: $PR"; eval "$PR"; info "  Applying: $PO"; eval "$PO"
+        FORWARDING_RULES+=("$PR" "$PO")
+        success "Forward added: $SRC_PORT → $DST_PORT/$PROTOCOL"
+      done
     done
   fi
 
-  # ---------- Save config ---------------
-  info "Saving configuration → $CONFIG_FILE"
+  # Save config
+  info "Saving → $CONFIG_FILE"
   {
     echo "MAIN_INTERFACE=\"$MAIN_INTERFACE\""
     echo "LOCAL_IP=\"$LOCAL_IP\""
     echo "LOCAL_IP_SUFFIX=$LOCAL_IP_SUFFIX"
     echo "GATEWAY_IP_SUFFIX=$GATEWAY_IP_SUFFIX"
-    printf "REMOTE_ENDPOINTS=("
-    for ep in "${REMOTE_ENDPOINTS[@]}"; do printf "%q " "$ep"; done
-    printf ")\n"
-    printf "RESOLVED_REMOTE_IPS=("
-    for ip in "${RESOLVED_REMOTE_IPS[@]}"; do printf "%q " "$ip"; done
-    printf ")\n"
-    printf "INTERNAL_TUNNEL_IPS=("
-    for tip in "${INTERNAL_TUNNEL_IPS[@]}"; do printf "%q " "$tip"; done
-    printf ")\n"
-    printf "MASQUERADE_RULES=("
-    for rule in "${MASQUERADE_RULES[@]}"; do printf "%q " "$rule"; done
-    printf ")\n"
-    printf "FORWARDING_RULES=("
-    for rule in "${FORWARDING_RULES[@]}"; do printf "%q " "$rule"; done
-    printf ")\n"
+    printf "REMOTE_ENDPOINTS=("; for ep in "${REMOTE_ENDPOINTS[@]}"; do printf "%q " "$ep"; done; printf ")\n"
+    printf "RESOLVED_REMOTE_IPS=("; for ip in "${RESOLVED_REMOTE_IPS[@]}"; do printf "%q " "$ip"; done; printf ")\n"
+    printf "INTERNAL_TUNNEL_IPS=("; for tip in "${INTERNAL_TUNNEL_IPS[@]}"; do printf "%q " "$tip"; done; printf ")\n"
+    printf "MASQUERADE_RULES=("; for r in "${MASQUERADE_RULES[@]}"; do printf "%q " "$r"; done; printf ")\n"
+    printf "FORWARDING_RULES=("; for r in "${FORWARDING_RULES[@]}"; do printf "%q " "$r"; done; printf ")\n"
     echo "PING_INTERVAL=$PING_INTERVAL"
     echo "MONITOR_FAIL_THRESHOLD=$MONITOR_FAIL_THRESHOLD"
   } > "$CONFIG_FILE"
 
-  # ---------- Create services ----------------
-  create_persistence_service
-  create_monitor_service
+# ---------- Create services ----------------
+create_persistence_service
+create_monitor_service
 
-  systemctl daemon-reload
-  systemctl enable --now gre-persistence.service gre-monitor.service
+systemctl daemon-reload
+systemctl enable gre-persistence.service gre-monitor.service
+systemctl restart gre-persistence.service gre-monitor.service
 
-  # ---------- Final Step: Optimizer ----------
+
+  # Optimizer
   run_optimizer
 
-  success "All done! Total time: $(( $(date +%s) - SCRIPT_START )) s"
-  info    "Reboot may be needed for kernel optimizations to take full effect."
+  success "All done! Time: $(( $(date +%s) - SCRIPT_START )) s"
+  info "You may reboot for kernel tweaks to fully apply."
 }
 
 create_persistence_service() {
@@ -294,60 +211,41 @@ create_persistence_service() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 [[ -f /etc/gre-tunnels.conf ]] || exit 0
-# shellcheck disable=SC1091
 source /etc/gre-tunnels.conf
 
-# Detect current server's local/public IPv4 once at boot
 detect_local_ip() {
   ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if ($i=="src"){print $(i+1); exit}}' \
   || ip -4 addr show scope global | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1 \
   || curl -4 -s icanhazip.com 2>/dev/null
 }
-
-is_valid_ip() { [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
-resolve_remote() {
-  local t="$1" ip=""
-  if is_valid_ip "$t"; then echo "$t"; return 0; fi
-  ip=$(getent ahostsv4 "$t" | awk '{print $1; exit}') || true
-  [[ -n $ip ]] && echo "$ip" || return 1
-}
+is_valid_ip(){ [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+resolve_once(){ local t="$1"; is_valid_ip "$t" && { echo "$t"; return 0; }; getent ahostsv4 "$t" | awk '{print $1; exit}'; }
 
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
-# (0) If local IP changed (e.g., snapshot), update config & use the new one
 CURRENT_LOCAL_IP="$(detect_local_ip)"
 if [[ -n "$CURRENT_LOCAL_IP" && "$CURRENT_LOCAL_IP" != "$LOCAL_IP" ]]; then
-  echo "[INFO] LOCAL_IP changed: $LOCAL_IP -> $CURRENT_LOCAL_IP (updating config & tunnels)"
+  echo "[INFO] LOCAL_IP changed: $LOCAL_IP -> $CURRENT_LOCAL_IP (update config)"
   sed -i -E 's|^LOCAL_IP="[^"]*"|LOCAL_IP="'"$CURRENT_LOCAL_IP"'"|' /etc/gre-tunnels.conf || true
   LOCAL_IP="$CURRENT_LOCAL_IP"
 fi
 
-# Restore NAT/Masquerade rules (idempotent)
-for rule_cmd in "${MASQUERADE_RULES[@]}"; do
-  check_cmd="${rule_cmd/ -A /-C }"
-  if ! eval "$check_cmd" &>/dev/null; then eval "$rule_cmd"; fi
-done
+# Restore NAT (idempotent)
+for cmd in "${MASQUERADE_RULES[@]}"; do chk="${cmd/ -A /-C }"; eval "$chk" &>/dev/null || eval "$cmd"; done
 
-# Create/restore tunnels (resolve endpoints each boot)
+# Re-create tunnels on boot (fresh resolve)
 for i in "${!REMOTE_ENDPOINTS[@]}"; do
-  TUN="gre$((i+1))"
-  ENDPOINT="${REMOTE_ENDPOINTS[$i]}"
-  RESOLVED="$(resolve_remote "$ENDPOINT" || true)"
-  [[ -z "$RESOLVED" ]] && { echo "WARN: cannot resolve $ENDPOINT"; continue; }
-
-  ip link set "$TUN" down 2>/dev/null || true
-  ip tunnel del "$TUN" 2>/dev/null || true
-  ip tunnel add "$TUN" mode gre remote "$RESOLVED" local "$LOCAL_IP" ttl 255
-  ip addr add "${INTERNAL_TUNNEL_IPS[$i]}" dev "$TUN" 2>/dev/null || true
+  TUN="gre$((i+1))"; EP="${REMOTE_ENDPOINTS[$i]}"; CIDR="${INTERNAL_TUNNEL_IPS[$i]}"
+  REM="$(resolve_once "$EP" || true)"; [[ -z "$REM" ]] && { echo "[WARN] cannot resolve $EP"; continue; }
+  ip link set "$TUN" down 2>/dev/null || true; ip tunnel del "$TUN" 2>/dev/null || true
+  ip tunnel add "$TUN" mode gre remote "$REM" local "$LOCAL_IP" ttl 255
+  ip addr add "$CIDR" dev "$TUN" 2>/dev/null || true
   ip link set "$TUN" up
   sysctl -w "net.ipv4.conf.${TUN}.rp_filter=0" >/dev/null || true
 done
 
-# Restore custom port forwarding rules
-for rule in "${FORWARDING_RULES[@]}"; do
-  check_cmd="${rule/-A /-C }"
-  if ! eval "$check_cmd" &>/dev/null; then eval "$rule"; fi
-done
+# Restore custom forwards
+for r in "${FORWARDING_RULES[@]}"; do chk="${r/-A /-C }"; eval "$chk" &>/dev/null || eval "$r"; done
 BASH
   chmod +x "$PERSISTENCE_SCRIPT"
 
@@ -374,61 +272,52 @@ create_monitor_service() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 [[ -f /etc/gre-tunnels.conf ]] || exit 0
-# shellcheck disable=SC1091
 source /etc/gre-tunnels.conf
 
 INTERVAL=${PING_INTERVAL:-10}
 THRESHOLD=${MONITOR_FAIL_THRESHOLD:-3}
 
-is_valid_ip() { [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+is_valid_ip(){ [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 
-# hostname -> IPv4
-resolve_remote() {
-  local t="$1" ip=""
+# return all A records (space-separated); if input is IP, echo it
+resolve_all(){
+  local t="$1"
   if is_valid_ip "$t"; then echo "$t"; return 0; fi
-  ip=$(getent ahostsv4 "$t" | awk '{print $1; exit}') || true
-  [[ -n $ip ]] && echo "$ip" || return 1
+  local ips; ips=$(getent ahostsv4 "$t" | awk '{print $1}' | awk '!seen[$0]++') || true
+  [[ -n $ips ]] && echo "$ips" || return 1
 }
 
-# اگر تونل وجود نداشت، با endpoint و LOCAL_IP بسازش و بالا بیار
-ensure_tun_present() { # $1=tun $2=endpoint $3=cidr
-  local tun="$1" ep="$2" cidr="$3" remote=""
-  if ip link show "$tun" &>/dev/null; then
-    return 0
-  fi
-  remote="$(resolve_remote "$ep" || true)"
-  [[ -z "$remote" ]] && { echo "[MONITOR] WARN: cannot resolve $ep to create $tun"; return 1; }
-  ip tunnel add "$tun" mode gre remote "$remote" local "$LOCAL_IP" ttl 255 || return 1
+# ensure tunnel exists; create if missing
+ensure_tun_present(){ # $1=tun $2=endpoint $3=cidr
+  local tun="$1" ep="$2" cidr="$3" set first
+  ip link show "$tun" &>/dev/null && return 0
+  set="$(resolve_all "$ep" || true)"; first="$(awk '{print $1}' <<<"$set")"
+  [[ -z "$first" ]] && { echo "[MONITOR] WARN: cannot resolve $ep to create $tun"; return 1; }
+  ip tunnel add "$tun" mode gre remote "$first" local "$LOCAL_IP" ttl 255 || return 1
   ip addr add "$cidr" dev "$tun" 2>/dev/null || true
   ip link set "$tun" up || true
   sysctl -w "net.ipv4.conf.${tun}.rp_filter=0" >/dev/null || true
-  echo "[MONITOR] recreated $tun → remote=$remote cidr=$cidr"
+  echo "[MONITOR] recreated $tun → remote=$first cidr=$cidr"
   return 0
 }
 
-# مطمئن شو آدرس داخلی هست و لینک up است
-ensure_addr_up() { # $1=tun $2=cidr
-  ip addr show dev "$1" | grep -q " ${2//\//\\/} " || ip addr add "$2" dev "$1"
-  ip link set "$1" up || true
-}
+ensure_addr_up(){ ip addr show dev "$1" | grep -q " ${2//\//\\/} " || ip addr add "$2" dev "$1"; ip link set "$1" up || true; }
 
 while true; do
   for i in "${!REMOTE_ENDPOINTS[@]}"; do
-    TUN="gre$((i+1))"
-    EP="${REMOTE_ENDPOINTS[$i]}"
-    CIDR="${INTERNAL_TUNNEL_IPS[$i]}"
+    TUN="gre$((i+1))"; EP="${REMOTE_ENDPOINTS[$i]}"; CIDR="${INTERNAL_TUNNEL_IPS[$i]}"
 
-    # 0) اگر تونل نیست، بساز
+    # 0) ensure tunnelexists
     ensure_tun_present "$TUN" "$EP" "$CIDR" || { sleep "$INTERVAL"; continue; }
-
-    # 1) ensure link & address
+    # 1) ensure address/up
     ensure_addr_up "$TUN" "$CIDR"
 
-    # 2) DNS-monitor: فقط برای دامنه‌ها → اگر IP عوض شد، rebuild
+    # 2) DNS-monitor (only for domains): if current remote not in A-set -> rebuild to first
     if ! is_valid_ip "$EP"; then
-      NEW_REMOTE="$(resolve_remote "$EP" || true)"
+      NEW_SET="$(resolve_all "$EP" || true)"
       CUR_REMOTE="$(ip -d tunnel show "$TUN" 2>/dev/null | awk '/remote/ {print $4; exit}')"
-      if [[ -n "$NEW_REMOTE" && "$NEW_REMOTE" != "$CUR_REMOTE" ]]; then
+      if [[ -n "$NEW_SET" ]] && ! grep -qw "$CUR_REMOTE" <<<"$NEW_SET"; then
+        NEW_REMOTE="$(awk '{print $1; exit}' <<<"$NEW_SET")"
         echo "[MONITOR] $TUN remote changed for $EP: $CUR_REMOTE -> $NEW_REMOTE (rebuild)"
         ip link set "$TUN" down 2>/dev/null || true
         ip tunnel del "$TUN" 2>/dev/null || true
@@ -438,25 +327,16 @@ while true; do
       fi
     fi
 
-    # 3) Health-monitor: پینگ به IP داخلی طرف مقابل (برای همه‌ی تونل‌ها)
-    LOCAL_INNER="${CIDR%%/*}"                 # مثل 20.0.0.2
-    BASE="$(echo "$LOCAL_INNER" | cut -d'.' -f1-3)"
-    HOST="$(echo "$LOCAL_INNER" | cut -d'.' -f4)"
-    if [[ "$HOST" == "$LOCAL_IP_SUFFIX" ]]; then
-      PEER="$BASE.$GATEWAY_IP_SUFFIX"        # 20.0.0.1
-    else
-      PEER="$BASE.$LOCAL_IP_SUFFIX"          # fallback
-    fi
-
+    # 3) Health-monitor: ping peer internal IP
+    LOCAL_INNER="${CIDR%%/*}"; BASE="$(echo "$LOCAL_INNER" | cut -d'.' -f1-3)"; HOST="$(echo "$LOCAL_INNER" | cut -d'.' -f4)"
+    if [[ "$HOST" == "$LOCAL_IP_SUFFIX" ]]; then PEER="$BASE.$GATEWAY_IP_SUFFIX"; else PEER="$BASE.$LOCAL_IP_SUFFIX"; fi
     if ! ping -c "$THRESHOLD" -W 2 "$PEER" &>/dev/null; then
       echo "[MONITOR] $TUN ping $PEER failed → bounce"
       ip link set "$TUN" down 2>/dev/null || true
       ip link set "$TUN" up   2>/dev/null || true
-      # اگر تونل در bounce حذف شد، دوباره بساز
       ip link show "$TUN" &>/dev/null || ensure_tun_present "$TUN" "$EP" "$CIDR"
       ping -c 1 -W 2 "$PEER" &>/dev/null || echo "[MONITOR] $TUN still failing to ping $PEER"
     fi
-
   done
   sleep "${INTERVAL:-10}"
 done
@@ -465,7 +345,7 @@ BASH
 
   cat > "$MONITOR_SERVICE" <<EOF
 [Unit]
-Description=Keep GRE tunnels alive (DNS + Health ping; auto-recreate greX)
+Description=Keep GRE tunnels alive (DNS + Health; auto-recreate greX)
 After=gre-persistence.service
 Wants=gre-persistence.service
 ConditionPathExists=$CONFIG_FILE
@@ -481,11 +361,8 @@ EOF
   success "Monitor unit created."
 }
 
-# --- Optimizer Functions (unchanged) ---
-apply_tcp_settings() {
-    info "Writing TCP-optimized settings..."
-    cat > /etc/sysctl.conf <<'EOF'
-# TCP-focused Kernel Settings (Auto-generated by script)
+# --- Optimizer ---
+apply_tcp_settings(){ cat > /etc/sysctl.conf <<'EOF'
 vm.swappiness = 1
 vm.min_free_kbytes = 65536
 vm.dirty_ratio = 5
@@ -517,11 +394,7 @@ net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
 }
-
-apply_udp_settings() {
-    info "Writing UDP-optimized settings..."
-    cat > /etc/sysctl.conf <<'EOF'
-# UDP-focused Kernel Settings (Auto-generated by script)
+apply_udp_settings(){ cat > /etc/sysctl.conf <<'EOF'
 vm.swappiness = 1
 vm.min_free_kbytes = 65536
 vm.dirty_ratio = 5
@@ -553,82 +426,33 @@ net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
 }
-
-run_optimizer() {
-    info "------------- Kernel Optimization Wizard -------------"
-    read -r -p "Do you want to optimize server kernel settings now? (y/N): " optimize_confirm
-    [[ $optimize_confirm =~ ^[Yy]$ ]] || { info "Skipping kernel optimization."; return; }
-
-    echo
-    info "Please select the optimization profile:"
-    echo "  1) TCP Profile (Best for VLESS, Trojan, etc.)"
-    echo "  2) UDP Profile (Best for Gaming, WireGuard, etc.)"
-    echo
-
-    local choice
-    while true; do
-        read -p "Enter your choice [1 or 2]: " choice
-        case $choice in
-            1|2) break ;;
-            *) warn "Invalid input. Please enter 1 or 2." ;;
-        esac
-    done
-
-    echo
-    read -p "This will OVERWRITE /etc/sysctl.conf. Are you sure? [y/N]: " final_confirm
-    if [[ ! "$final_confirm" =~ ^[Yy]$ ]]; then
-        info "Operation cancelled."
-        return
-    fi
-
-    info "Backing up /etc/sysctl.conf to /etc/sysctl.conf.bak.$(date +%F)..."
-    cp /etc/sysctl.conf /etc/sysctl.conf.bak.$(date +%F) 2>/dev/null || true
-
-    if [ "$choice" -eq 1 ]; then
-        apply_tcp_settings
-    else
-        apply_udp_settings
-    fi
-
-    info "Applying new sysctl settings..."
-    if sysctl -p; then
-        success "Kernel settings applied."
-    else
-        error "Failed to apply kernel settings."
-    fi
-
-    echo
-    read -p "A reboot is recommended. Reboot now? [y/N]: " reboot_confirm
-    if [[ "$reboot_confirm" =~ ^[Yy]$ ]]; then
-        info "Rebooting now..."
-        reboot
-    else
-        warn "Please remember to reboot later to apply all changes."
-    fi
+run_optimizer(){
+  info "------------- Kernel Optimization Wizard -------------"
+  read -r -p "Do you want to optimize server kernel settings now? (y/N): " ok
+  [[ $ok =~ ^[Yy]$ ]] || { info "Skipping kernel optimization."; return; }
+  echo; info "Select profile:"; echo "  1) TCP Profile"; echo "  2) UDP Profile"; echo
+  local c; while true; do read -p "Enter your choice [1 or 2]: " c; [[ $c =~ ^[12]$ ]] && break || warn "Enter 1 or 2."; done
+  read -p "This will OVERWRITE /etc/sysctl.conf. Are you sure? [y/N]: " y; [[ $y =~ ^[Yy]$ ]] || { info "Cancelled."; return; }
+  info "Backup -> /etc/sysctl.conf.bak.$(date +%F)"; cp /etc/sysctl.conf /etc/sysctl.conf.bak.$(date +%F) 2>/dev/null || true
+  [[ $c -eq 1 ]] && apply_tcp_settings || apply_udp_settings
+  info "Applying sysctl..."; sysctl -p && success "Kernel settings applied." || error "Failed to apply sysctl."
+  read -p "Reboot now? [y/N]: " rb; [[ $rb =~ ^[Yy]$ ]] && { info "Rebooting..."; reboot; } || warn "Reboot later to fully apply."
 }
 
-delete_all_tunnels() {
-  warn "This will remove EVERY tunnel, config & service created by this tool."
-  read -r -p "Really continue? (y/N): " confirm
-  [[ $confirm =~ ^[Yy]$ ]] || { info "Aborted."; return; }
-
+delete_all_tunnels(){
+  warn "This removes ALL tunnels, config & services created by this tool."
+  read -r -p "Really continue? (y/N): " c; [[ $c =~ ^[Yy]$ ]] || { info "Aborted."; return; }
   systemctl stop gre-monitor.service gre-persistence.service 2>/dev/null || true
   systemctl disable gre-monitor.service gre-persistence.service 2>/dev/null || true
   rm -f "$MONITOR_SERVICE" "$PERSISTENCE_SERVICE" "$MONITOR_SCRIPT" "$PERSISTENCE_SCRIPT" "$CONFIG_FILE"
   systemctl daemon-reload
-
-  ip -o link show type gre | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r tun; do
-    [[ -n $tun ]] && { ip link delete "$tun" && echo "  - $tun removed."; } || true
-  done
-  
-  warn "Note: Kernel settings in /etc/sysctl.conf have NOT been reverted."
-  warn "Original backups are stored as /etc/sysctl.conf.bak.YYYY-MM-DD"
+  ip -o link show type gre | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r t; do [[ -n $t ]] && ip link delete "$t" && echo "  - $t removed."; done
+  warn "Kernel /etc/sysctl.conf NOT reverted. Backups in /etc/sysctl.conf.bak.YYYY-MM-DD"
   success "Cleanup complete."
 }
 
-main_menu() {
-  clear
-  echo "--------- GRE Tunnel Manager ---------"
+main_menu(){
+  clear; echo "--------- GRE Tunnel Manager ---------"
   echo " 1) Create / Reconfigure tunnels"
   echo " 2) Delete ALL tunnels & services"
   echo " 3) Exit"
