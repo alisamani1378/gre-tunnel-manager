@@ -363,24 +363,44 @@ EOF
 
 # --- Optimizer ---
 apply_tcp_settings(){ cat > /etc/sysctl.conf <<'EOF'
+# ---- High-Concurrency TCP Profile (BBR + FQ) ----
 vm.swappiness = 1
 vm.min_free_kbytes = 65536
 vm.dirty_ratio = 5
 vm.dirty_background_ratio = 2
 vm.vfs_cache_pressure = 50
-net.core.somaxconn = 65536
-net.core.netdev_max_backlog = 65536
+
+# File descriptors (سیستمی)
+fs.file-max = 2097152
+
+# Queueing / Backlogs
+net.core.default_qdisc = fq
+net.core.somaxconn = 262144
+net.core.netdev_max_backlog = 262144
+
+# Socket buffers (defaults معقول برای کانکشن زیاد)
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
 net.core.rmem_max = 33554432
 net.core.wmem_max = 33554432
+net.core.optmem_max = 65536
+
+# TCP
 net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_rmem = 4096 87380 33554432
-net.ipv4.tcp_wmem = 4096 65536 33554432
-net.ipv4.tcp_max_syn_backlog = 65536
+net.ipv4.tcp_max_syn_backlog = 262144
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_rmem = 4096 87380 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
+
+# Ephemeral ports
+net.ipv4.ip_local_port_range = 10000 65000
+
+# Routing / Security
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.rp_filter = 0
 net.ipv4.conf.default.rp_filter = 0
@@ -389,30 +409,58 @@ net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv4.conf.all.secure_redirects = 0
 net.ipv4.conf.default.secure_redirects = 0
+
+# IPv6 (همانند قبل)
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
+
+# Neighbor table (برای peerهای بیشتر)
+net.ipv4.neigh.default.gc_thresh1 = 1024
+net.ipv4.neigh.default.gc_thresh2 = 2048
+net.ipv4.neigh.default.gc_thresh3 = 4096
 EOF
 }
+
 apply_udp_settings(){ cat > /etc/sysctl.conf <<'EOF'
+# ---- High-Concurrency UDP/QUIC + Mixed Profile ----
 vm.swappiness = 1
 vm.min_free_kbytes = 65536
 vm.dirty_ratio = 5
 vm.dirty_background_ratio = 2
 vm.vfs_cache_pressure = 50
-net.core.somaxconn = 65536
-net.core.netdev_max_backlog = 65536
-net.core.rmem_default = 2097152
-net.core.wmem_default = 2097152
+
+fs.file-max = 2097152
+
+# Queueing / Backlogs
+net.core.default_qdisc = fq
+net.core.somaxconn = 262144
+net.core.netdev_max_backlog = 262144
+
+# Socket buffers (defaults معقول، حداکثرها مثل TCP)
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
 net.core.rmem_max = 33554432
 net.core.wmem_max = 33554432
-net.ipv4.udp_mem = 2097152 4194304 8388608
+net.core.optmem_max = 131072
+
+# UDP minimums (برای جلوگیری از drop در ترافیک بالا؛ واحد بایت)
+net.ipv4.udp_rmem_min = 131072
+net.ipv4.udp_wmem_min = 131072
+# توجه: udp_mem را دست‌نمی‌زنیم تا نسبت به RAM سیستم بیش‌ازحد اختصاص داده نشود.
+
+# TCP (به‌خاطر ترافیک میکس)
 net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_max_syn_backlog = 65536
+net.ipv4.tcp_max_syn_backlog = 262144
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_mtu_probing = 1
+
+# Ephemeral ports
+net.ipv4.ip_local_port_range = 10000 65000
+
+# Routing / Security
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.rp_filter = 0
 net.ipv4.conf.default.rp_filter = 0
@@ -421,11 +469,19 @@ net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv4.conf.all.secure_redirects = 0
 net.ipv4.conf.default.secure_redirects = 0
+
+# IPv6 (همانند قبل)
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
+
+# Neighbor table
+net.ipv4.neigh.default.gc_thresh1 = 1024
+net.ipv4.neigh.default.gc_thresh2 = 2048
+net.ipv4.neigh.default.gc_thresh3 = 4096
 EOF
 }
+
 run_optimizer(){
   info "------------- Kernel Optimization Wizard -------------"
   read -r -p "Do you want to optimize server kernel settings now? (y/N): " ok
