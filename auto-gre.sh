@@ -95,11 +95,11 @@ remove_rules_from_config(){
 remove_gre_masquerade_best_effort(){
   info "Scanning for stray MASQUERADE rules on gre*..."
   local line del
-  # Check both backends' listings and attempt deletion through helper (which tries both backends too)
+  # Check both backends' listings and use awk to avoid grep option issues on some systems
   {
     iptables -t nat -S POSTROUTING 2>/dev/null || true
     if command -v iptables-legacy >/dev/null 2>&1; then iptables-legacy -t nat -S POSTROUTING 2>/dev/null || true; fi
-  } | grep -F -e "-A POSTROUTING" | grep -E -e "-o gre[0-9]+" | grep -F -e "-j MASQUERADE" | while IFS= read -r line; do
+  } | awk '/^-A POSTROUTING/ && /-o gre[0-9]+/ && /-j MASQUERADE/' | while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     del="${line/-A /-D }"
     _eval_on_iptables_variants "iptables -t nat $del"
