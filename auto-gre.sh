@@ -42,6 +42,62 @@ resolve_remote_once() { # hostname/ip -> one IPv4
 }
 prompt_default(){ local a; read -r -p "$1 [$2]: " a; echo "${a:-$2}"; }
 
+# ---------- Firewall cleanup helpers -----------------------------------------
+# Run an iptables command on both variants if available (iptables and iptables-legacy)
+_eval_on_iptables_variants(){
+  local cmd="$1"
+  # run with "iptables" (as-is)
+  eval "$cmd" 2>/dev/null || true
+  # if iptables-legacy exists, try with that too
+  if command -v iptables-legacy >/dev/null 2>&1; then
+    local legacy_cmd
+    legacy_cmd="${cmd/iptables /iptables-legacy }"
+    eval "$legacy_cmd" 2>/dev/null || true
+  fi
+}
+
+# Remove rules previously written by this tool (reads arrays in $CONFIG_FILE)
+remove_rules_from_config(){
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+  local had=0
+  if [[ ${#MASQUERADE_RULES[@]:-0} -gt 0 ]] || [[ ${#FORWARDING_RULES[@]:-0} -gt 0 ]]; then
+    info "Removing previously configured firewall rules from $CONFIG_FILE..."
+    had=1
+  fi
+  for r in "${MASQUERADE_RULES[@]:-}"; do
+    [[ -n "$r" ]] || continue
+    local del; del="${r/ -A / -D }"; del="${del/-A /-D }"
+    # ensure we're calling iptables even if r already has it
+    if [[ "$del" != iptables* ]]; then del="iptables ${del}"; fi
+    _eval_on_iptables_variants "$del"
+  done
+  for r in "${FORWARDING_RULES[@]:-}"; do
+    [[ -n "$r" ]] || continue
+    local del; del="${r/ -A / -D }"; del="${del/-A /-D }"
+    if [[ "$del" != iptables* ]]; then del="iptables ${del}"; fi
+    _eval_on_iptables_variants "$del"
+  done
+  [[ $had -eq 1 ]] && success "Old rules removed (if present)."
+}
+
+# Best-effort removal of any MASQUERADE rules on gre* in POSTROUTING when not flushing
+remove_gre_masquerade_best_effort(){
+  info "Scanning for stray MASQUERADE rules on gre*..."
+  local line del
+  # Check both backends' listings and attempt deletion through helper (which tries both backends too)
+  {
+    iptables -t nat -S POSTROUTING 2>/dev/null || true
+    if command -v iptables-legacy >/dev/null 2>&1; then iptables-legacy -t nat -S POSTROUTING 2>/dev/null || true; fi
+  } | grep -E "^-A POSTROUTING" | grep -E "-o gre[0-9]+" | grep -E "-j MASQUERADE" | while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    del="${line/-A /-D }"
+    _eval_on_iptables_variants "iptables -t nat $del"
+  done
+  success "Stray MASQUERADE cleanup attempted."
+}
+
 # =====================================================================
 # ====================== Actions (Wizard) =============================
 # =====================================================================
@@ -80,9 +136,16 @@ create_new_tunnels() {
   if [[ $delete_choice != 2 ]]; then
     info "Deleting existing GRE tunnels..."
     ip -o link show type gre | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r t; do [[ -n $t ]] && ip link delete "$t" && echo "  - $t removed."; done
+    # Even if not flushing, remove our previously-added firewall rules so old SNAT/MASQUERADE won't linger
+    remove_rules_from_config
+    remove_gre_masquerade_best_effort
   fi
   if [[ $flush_choice != 2 ]]; then
     info "Flushing iptables..."; iptables -F; iptables -t nat -F; iptables -t mangle -F; iptables -X; iptables -t nat -X; iptables -t mangle -X
+  else
+    # Not flushing: still ensure our previously-added rules are gone
+    remove_rules_from_config
+    remove_gre_masquerade_best_effort
   fi
 
   # Net basic
@@ -500,6 +563,9 @@ delete_all_tunnels(){
   read -r -p "Really continue? (y/N): " c; [[ $c =~ ^[Yy]$ ]] || { info "Aborted."; return; }
   systemctl stop gre-monitor.service gre-persistence.service 2>/dev/null || true
   systemctl disable gre-monitor.service gre-persistence.service 2>/dev/null || true
+  # Remove firewall rules we had installed previously (without flushing unrelated rules)
+  remove_rules_from_config
+  remove_gre_masquerade_best_effort
   rm -f "$MONITOR_SERVICE" "$PERSISTENCE_SERVICE" "$MONITOR_SCRIPT" "$PERSISTENCE_SCRIPT" "$CONFIG_FILE"
   systemctl daemon-reload
   ip -o link show type gre | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r t; do [[ -n $t ]] && ip link delete "$t" && echo "  - $t removed."; done
