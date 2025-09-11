@@ -107,6 +107,34 @@ remove_gre_masquerade_best_effort(){
   success "Stray MASQUERADE cleanup attempted."
 }
 
+# ---------- Full reset helpers ----------------------------------------------
+flush_all_tables(){
+  info "Flushing iptables (all tables)..."
+  local tbl cmd
+  for tbl in filter nat mangle raw security; do
+    cmd="iptables -t $tbl -F"; eval "$cmd" 2>/dev/null || true
+    cmd="iptables -t $tbl -X"; eval "$cmd" 2>/dev/null || true
+  done
+  # also try legacy backend if present
+  if command -v iptables-legacy >/dev/null 2>&1; then
+    for tbl in filter nat mangle raw security; do
+      iptables-legacy -t "$tbl" -F 2>/dev/null || true
+      iptables-legacy -t "$tbl" -X 2>/dev/null || true
+    done
+  fi
+  success "Firewall flushed."
+}
+
+remove_services_and_config(){
+  info "Stopping and removing GRE services and config..."
+  systemctl stop gre-monitor.service gre-persistence.service 2>/dev/null || true
+  systemctl disable gre-monitor.service gre-persistence.service 2>/dev/null || true
+  rm -f "$MONITOR_SERVICE" "$PERSISTENCE_SERVICE" "$MONITOR_SCRIPT" "$PERSISTENCE_SCRIPT" 2>/dev/null || true
+  rm -f "$CONFIG_FILE" 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+  success "Services and config removed."
+}
+
 # =====================================================================
 # ====================== Actions (Wizard) =============================
 # =====================================================================
@@ -142,19 +170,25 @@ create_new_tunnels() {
   success "Interface '$MAIN_INTERFACE' selected."
 
   # Cleanup
-  if [[ $delete_choice != 2 ]]; then
+  if [[ "$flush_choice" == "1" ]]; then
+    # Full reset path: stop/remove services + config, delete all tunnels, flush all firewall tables
+    remove_services_and_config
     info "Deleting existing GRE tunnels..."
     ip -o link show type gre | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r t; do [[ -n $t ]] && ip link delete "$t" && echo "  - $t removed."; done
-    # Even if not flushing, remove our previously-added firewall rules so old SNAT/MASQUERADE won't linger
-    remove_rules_from_config
-    remove_gre_masquerade_best_effort
-  fi
-  if [[ $flush_choice != 2 ]]; then
-    info "Flushing iptables..."; iptables -F; iptables -t nat -F; iptables -t mangle -F; iptables -X; iptables -t nat -X; iptables -t mangle -X
+    flush_all_tables
   else
-    # Not flushing: still ensure our previously-added rules are gone
-    remove_rules_from_config
-    remove_gre_masquerade_best_effort
+    # Partial cleanup depending on choice
+    if [[ $delete_choice != 2 ]]; then
+      info "Deleting existing GRE tunnels..."
+      ip -o link show type gre | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r t; do [[ -n $t ]] && ip link delete "$t" && echo "  - $t removed."; done
+      # Even if not flushing, remove our previously-added firewall rules so old SNAT/MASQUERADE won't linger
+      remove_rules_from_config
+      remove_gre_masquerade_best_effort
+    else
+      # Not flushing and not deleting: still ensure our previously-added rules are gone
+      remove_rules_from_config
+      remove_gre_masquerade_best_effort
+    fi
   fi
 
   # Net basic
