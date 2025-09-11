@@ -99,7 +99,7 @@ remove_gre_masquerade_best_effort(){
   {
     iptables -t nat -S POSTROUTING 2>/dev/null || true
     if command -v iptables-legacy >/dev/null 2>&1; then iptables-legacy -t nat -S POSTROUTING 2>/dev/null || true; fi
-  } | grep -E -- "^-A POSTROUTING" | grep -E -- "-o gre[0-9]+" | grep -E -- "-j MASQUERADE" | while IFS= read -r line; do
+  } | grep -F -e "-A POSTROUTING" | grep -E -e "-o gre[0-9]+" | grep -F -e "-j MASQUERADE" | while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     del="${line/-A /-D }"
     _eval_on_iptables_variants "iptables -t nat $del"
