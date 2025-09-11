@@ -60,25 +60,34 @@ _eval_on_iptables_variants(){
 remove_rules_from_config(){
   [[ -f "$CONFIG_FILE" ]] || return 0
   # shellcheck disable=SC1090
+  set +u
   source "$CONFIG_FILE"
+  set -u
   local had=0
-  if [[ ${#MASQUERADE_RULES[@]:-0} -gt 0 ]] || [[ ${#FORWARDING_RULES[@]:-0} -gt 0 ]]; then
-    info "Removing previously configured firewall rules from $CONFIG_FILE..."
-    had=1
+  # Remove NAT/MASQUERADE rules if array exists
+  if declare -p MASQUERADE_RULES >/dev/null 2>&1; then
+    if ((${#MASQUERADE_RULES[@]} > 0)); then
+      info "Removing previously configured firewall rules from $CONFIG_FILE..."
+      had=1
+    fi
+    for r in "${MASQUERADE_RULES[@]}"; do
+      [[ -n "$r" ]] || continue
+      local del; del="${r/ -A / -D }"; del="${del/-A /-D }"
+      # ensure we're calling iptables even if r already has it
+      if [[ "$del" != iptables* ]]; then del="iptables ${del}"; fi
+      _eval_on_iptables_variants "$del"
+    done
   fi
-  for r in "${MASQUERADE_RULES[@]:-}"; do
-    [[ -n "$r" ]] || continue
-    local del; del="${r/ -A / -D }"; del="${del/-A /-D }"
-    # ensure we're calling iptables even if r already has it
-    if [[ "$del" != iptables* ]]; then del="iptables ${del}"; fi
-    _eval_on_iptables_variants "$del"
-  done
-  for r in "${FORWARDING_RULES[@]:-}"; do
-    [[ -n "$r" ]] || continue
-    local del; del="${r/ -A / -D }"; del="${del/-A /-D }"
-    if [[ "$del" != iptables* ]]; then del="iptables ${del}"; fi
-    _eval_on_iptables_variants "$del"
-  done
+  # Remove DNAT/SNAT forwards if array exists
+  if declare -p FORWARDING_RULES >/dev/null 2>&1; then
+    ((had==0 && ${#FORWARDING_RULES[@]} > 0)) && { info "Removing previously configured firewall rules from $CONFIG_FILE..."; had=1; }
+    for r in "${FORWARDING_RULES[@]}"; do
+      [[ -n "$r" ]] || continue
+      local del; del="${r/ -A / -D }"; del="${del/-A /-D }"
+      if [[ "$del" != iptables* ]]; then del="iptables ${del}"; fi
+      _eval_on_iptables_variants "$del"
+    done
+  fi
   [[ $had -eq 1 ]] && success "Old rules removed (if present)."
 }
 
@@ -274,7 +283,9 @@ create_persistence_service() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 [[ -f /etc/gre-tunnels.conf ]] || exit 0
+set +u
 source /etc/gre-tunnels.conf
+set -u
 
 detect_local_ip() {
   ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if ($i=="src"){print $(i+1); exit}}' \
@@ -294,7 +305,9 @@ if [[ -n "$CURRENT_LOCAL_IP" && "$CURRENT_LOCAL_IP" != "$LOCAL_IP" ]]; then
 fi
 
 # Restore NAT (idempotent)
-for cmd in "${MASQUERADE_RULES[@]}"; do chk="${cmd/ -A /-C }"; eval "$chk" &>/dev/null || eval "$cmd"; done
+if declare -p MASQUERADE_RULES >/dev/null 2>&1; then
+  for cmd in "${MASQUERADE_RULES[@]}"; do chk="${cmd/ -A /-C }"; eval "$chk" &>/dev/null || eval "$cmd"; done
+fi
 
 # Re-create tunnels on boot (fresh resolve)
 for i in "${!REMOTE_ENDPOINTS[@]}"; do
@@ -308,7 +321,9 @@ for i in "${!REMOTE_ENDPOINTS[@]}"; do
 done
 
 # Restore custom forwards
-for r in "${FORWARDING_RULES[@]}"; do chk="${r/-A /-C }"; eval "$chk" &>/dev/null || eval "$r"; done
+if declare -p FORWARDING_RULES >/dev/null 2>&1; then
+  for r in "${FORWARDING_RULES[@]}"; do chk="${r/-A /-C }"; eval "$chk" &>/dev/null || eval "$r"; done
+fi
 BASH
   chmod +x "$PERSISTENCE_SCRIPT"
 
