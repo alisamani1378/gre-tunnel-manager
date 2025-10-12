@@ -178,8 +178,9 @@ create_new_tunnels() {
     flush_all_tables
   else
     if [[ $delete_choice != 2 ]]; then
-      info "Deleting existing ${TUN_MODE^^} tunnels..."
-      ip -o link show type "$TUN_MODE" | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r t; do [[ -n $t ]] && ip link delete "$t" && echo "  - $t removed."; done
+      info "Deleting existing tunnels (GRE and IPIP)..."
+      ip -o link show type gre  | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r t; do [[ -n $t ]] && ip link delete "$t" && echo "  - $t removed."; done
+      ip -o link show type ipip | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r t; do [[ -n $t ]] && ip link delete "$t" && echo "  - $t removed."; done
       remove_rules_from_config
       remove_tunnel_masquerade_best_effort
     else
