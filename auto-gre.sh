@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # ------------------------------------------------------------------
 #  Universal Tunnel Manager (GRE or IPIP) + Domain-aware + Monitors
-#  Based on: "Universal GRE Tunnel Manager (Domain-aware) + Dual Monitors"
 #  Author  : Ali Samani – 2025 (extended for GRE/IPIP choice)
 #  License : MIT
 # ------------------------------------------------------------------
@@ -10,13 +9,14 @@ set -Eeuo pipefail
 SCRIPT_START=$(date +%s)
 
 # ---------- Constants ---------------------------------------------------------
-CONFIG_FILE="/etc/tunnel-manager.conf"     # renamed to be mode-agnostic
+CONFIG_FILE="/etc/tunnel-manager.conf"
 PERSISTENCE_SCRIPT="/usr/local/bin/tunnel-persistence.sh"
 MONITOR_SCRIPT="/usr/local/bin/tunnel-monitor.sh"
 PERSISTENCE_SERVICE="/etc/systemd/system/tunnel-persistence.service"
 MONITOR_SERVICE="/etc/systemd/system/tunnel-monitor.service"
 PING_INTERVAL=10            # seconds
 MONITOR_FAIL_THRESHOLD=3    # pings
+TMGR_COMMENT="TMGR"         # comment tag for firewall rules
 
 # ---------- Pretty print helpers ---------------------------------------------
 NC='\033[0m'; C_BLUE='\033[0;36m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_RED='\033[0;31m'
@@ -43,17 +43,50 @@ resolve_remote_once() { # hostname/ip -> one IPv4
 }
 prompt_default(){ local a; read -r -p "$1 [$2]: " a; echo "${a:-$2}"; }
 
-# ---------- Firewall cleanup helpers -----------------------------------------
+detect_public_ip() {
+  ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if ($i=="src"){print $(i+1); exit}}' \
+  || ip -4 addr show scope global | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1 \
+  || curl -4 -s --max-time 3 icanhazip.com
+}
+
+# ---------- iptables helpers (nft/legacy aware) -------------------------------
+_use_legacy() { command -v iptables-legacy >/dev/null 2>&1; }
+
 _eval_on_iptables_variants(){
   local cmd="$1"
   eval "$cmd" 2>/dev/null || true
-  if command -v iptables-legacy >/dev/null 2>&1; then
-    local legacy_cmd
-    legacy_cmd="${cmd/iptables /iptables-legacy }"
+  if _use_legacy; then
+    local legacy_cmd="${cmd/iptables /iptables-legacy }"
     eval "$legacy_cmd" 2>/dev/null || true
   fi
 }
 
+# Apply an iptables rule once (idempotent):
+# Expects full command string starting with "iptables -t <tbl> -A ..."
+ipt_apply_once(){
+  local add="$1"
+  local chk="${add/ -A / -C }"
+  _eval_on_iptables_variants "$chk" || _eval_on_iptables_variants "$add"
+}
+
+# Delete all rules created by this tool using comment marker
+cleanup_tmgr_rules(){
+  info "Removing firewall rules tagged with comment '$TMGR_COMMENT'..."
+  local tbl line del
+  for tbl in nat filter mangle raw; do
+    {
+      iptables -t "$tbl" -S 2>/dev/null || true
+      if _use_legacy; then iptables-legacy -t "$tbl" -S 2>/dev/null || true; fi
+    } | awk -v tag="$TMGR_COMMENT" '$0 ~ ("-m comment --comment " tag) && $0 ~ /^-A /{sub(/^-A /,"-D "); print}' \
+      | while IFS= read -r line; do
+          [[ -n "$line" ]] || continue
+          _eval_on_iptables_variants "iptables -t $tbl $line"
+        done
+  done
+  success "Tagged rules removed (if any)."
+}
+
+# ---------- Firewall cleanup helpers -----------------------------------------
 remove_rules_from_config(){
   [[ -f "$CONFIG_FILE" ]] || return 0
   set +u
@@ -63,22 +96,22 @@ remove_rules_from_config(){
   local had=0
   if declare -p MASQUERADE_RULES >/dev/null 2>&1; then
     if ((${#MASQUERADE_RULES[@]} > 0)); then
-      info "Removing previously configured firewall rules from $CONFIG_FILE..."
+      info "Removing previously configured MASQUERADE rules from $CONFIG_FILE..."
       had=1
     fi
     for r in "${MASQUERADE_RULES[@]}"; do
       [[ -n "$r" ]] || continue
-      local del; del="${r/ -A / -D }"; del="${del/-A /-D }"
-      if [[ "$del" != iptables* ]]; then del="iptables ${del}"; fi
+      local del="${r/ -A / -D }"; del="${del/-A /-D }"
+      [[ "$del" == iptables* ]] || del="iptables ${del}"
       _eval_on_iptables_variants "$del"
     done
   fi
   if declare -p FORWARDING_RULES >/dev/null 2>&1; then
-    ((had==0 && ${#FORWARDING_RULES[@]} > 0)) && { info "Removing previously configured firewall rules from $CONFIG_FILE..."; had=1; }
+    ((had==0 && ${#FORWARDING_RULES[@]} > 0)) && { info "Removing previously configured forwarding rules from $CONFIG_FILE..."; had=1; }
     for r in "${FORWARDING_RULES[@]}"; do
       [[ -n "$r" ]] || continue
-      local del; del="${r/ -A / -D }"; del="${del/-A /-D }"
-      if [[ "$del" != iptables* ]]; then del="iptables ${del}"; fi
+      local del="${r/ -A / -D }"; del="${del/-A /-D }"
+      [[ "$del" == iptables* ]] || del="iptables ${del}"
       _eval_on_iptables_variants "$del"
     done
   fi
@@ -87,26 +120,27 @@ remove_rules_from_config(){
 
 remove_tunnel_masquerade_best_effort(){
   info "Scanning for stray MASQUERADE rules on gre* / ipip*..."
-  local line del
+  local line
   {
     iptables -t nat -S POSTROUTING 2>/dev/null || true
-    if command -v iptables-legacy >/dev/null 2>&1; then iptables-legacy -t nat -S POSTROUTING 2>/dev/null || true; fi
-  } | awk '/^-A POSTROUTING/ && /-o (gre|ipip)[0-9]+/ && /-j MASQUERADE/' | while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-    del="${line/-A /-D }"
-    _eval_on_iptables_variants "iptables -t nat $del"
-  done
+    if _use_legacy; then iptables-legacy -t nat -S POSTROUTING 2>/dev/null || true; fi
+  } | awk '/^-A POSTROUTING/ && /-o (gre|ipip)[0-9]+/ && /-j MASQUERADE/' \
+    | while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        local del="${line/-A /-D }"
+        _eval_on_iptables_variants "iptables -t nat $del"
+      done
   success "Stray MASQUERADE cleanup attempted."
 }
 
 flush_all_tables(){
-  info "Flushing iptables (all tables)..."
+  warn "Flushing ALL iptables tables (filter/nat/mangle/raw/security)... this is DANGEROUS on production."
   local tbl
   for tbl in filter nat mangle raw security; do
     iptables -t "$tbl" -F 2>/dev/null || true
     iptables -t "$tbl" -X 2>/dev/null || true
   done
-  if command -v iptables-legacy >/dev/null 2>&1; then
+  if _use_legacy; then
     for tbl in filter nat mangle raw security; do
       iptables-legacy -t "$tbl" -F 2>/dev/null || true
       iptables-legacy -t "$tbl" -X 2>/dev/null || true
@@ -152,10 +186,30 @@ create_new_tunnels() {
   esac
   success "Internal IPs will end with .$LOCAL_IP_SUFFIX"
 
-  # 2) Cleanup
-  local delete_choice flush_choice
-  delete_choice=$(prompt_default "Delete existing ${TUN_MODE^^} tunnels first? (1=Yes, 2=No)" "1")
-  flush_choice=$(prompt_default "Flush ALL firewall rules? (1=Yes, 2=No)" "1")
+  # 2) Cleanup options (ask user)
+  local flush_choice delete_choice
+  flush_choice=$(prompt_default "Full flush firewall & services? (1=yes, 2=no)" "2")
+  delete_choice=$(prompt_default "Delete existing tunnels? (1=yes, 2=no)" "1")
+
+  # Cleanup
+  if [[ "$flush_choice" == "1" ]]; then
+    # Full cleanup: services + tunnels + all firewall tables
+    remove_services_and_config
+    info "Deleting existing tunnels (both GRE and IPIP)..."
+    ip -o link show type gre  | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r t; do [[ -n $t ]] && ip link delete "$t" && echo "  - $t removed."; done
+    ip -o link show type ipip | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r t; do [[ -n $t ]] && ip link delete "$t" && echo "  - $t removed."; done
+    flush_all_tables
+  elif [[ "$delete_choice" == "1" ]]; then
+    # Remove tunnels and tool-related firewall rules only
+    info "Deleting existing tunnels (GRE and IPIP)..."
+    ip -o link show type gre  | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r t; do [[ -n $t ]] && ip link delete "$t" && echo "  - $t removed."; done
+    ip -o link show type ipip | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r t; do [[ -n $t ]] && ip link delete "$t" && echo "  - $t removed."; done
+    remove_rules_from_config
+    cleanup_tmgr_rules
+    remove_tunnel_masquerade_best_effort
+  else
+    info "Skipping cleanup: no firewall or tunnel changes will be made."
+  fi
 
   # 3) Main interface
   mapfile -t INTERFACES < <(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -v "lo")
@@ -169,30 +223,10 @@ create_new_tunnels() {
   done
   success "Interface '$MAIN_INTERFACE' selected."
 
-  # Cleanup
-  if [[ "$flush_choice" == "1" ]]; then
-    remove_services_and_config
-    info "Deleting existing tunnels (both GRE and IPIP)..."
-    ip -o link show type gre  | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r t; do [[ -n $t ]] && ip link delete "$t" && echo "  - $t removed."; done
-    ip -o link show type ipip | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r t; do [[ -n $t ]] && ip link delete "$t" && echo "  - $t removed."; done
-    flush_all_tables
-  else
-    if [[ $delete_choice != 2 ]]; then
-      info "Deleting existing tunnels (GRE and IPIP)..."
-      ip -o link show type gre  | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r t; do [[ -n $t ]] && ip link delete "$t" && echo "  - $t removed."; done
-      ip -o link show type ipip | awk -F': ' '{print $2}' | cut -d'@' -f1 | while read -r t; do [[ -n $t ]] && ip link delete "$t" && echo "  - $t removed."; done
-      remove_rules_from_config
-      remove_tunnel_masquerade_best_effort
-    else
-      remove_rules_from_config
-      remove_tunnel_masquerade_best_effort
-    fi
-  fi
-
   # Net basic
   info "Enabling IP forwarding..."; sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
-  LOCAL_IP=$(curl -4 -s icanhazip.com || true)
+  LOCAL_IP="$(detect_public_ip || true)"
   [[ -z $LOCAL_IP ]] && { error "Couldn't auto-detect public IP"; exit 1; }
   success "Public IP detected: $LOCAL_IP"
 
@@ -243,13 +277,14 @@ create_new_tunnels() {
   declare -a MASQUERADE_RULES
   if [[ "$location_choice" == "1" ]]; then
     for i in "${!REMOTE_ENDPOINTS[@]}"; do
-      TUN="${TUN_PREFIX}$((i+1))"; rule="iptables -t nat -A POSTROUTING -o $TUN -j MASQUERADE"
-      MASQUERADE_RULES+=("$rule"); iptables -t nat -C POSTROUTING -o "$TUN" -j MASQUERADE 2>/dev/null || eval "$rule"
+      TUN="${TUN_PREFIX}$((i+1))"
+      rule="iptables -t nat -A POSTROUTING -o $TUN -m comment --comment $TMGR_COMMENT -j MASQUERADE"
+      MASQUERADE_RULES+=("$rule"); ipt_apply_once "$rule"
     done
     success "NAT on ${TUN_MODE^^} tunnels."
   else
-    rule="iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE"
-    MASQUERADE_RULES+=("$rule"); iptables -t nat -C POSTROUTING -o "$MAIN_INTERFACE" -j MASQUERADE 2>/dev/null || eval "$rule"
+    rule="iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -m comment --comment $TMGR_COMMENT -j MASQUERADE"
+    MASQUERADE_RULES+=("$rule"); ipt_apply_once "$rule"
     success "NAT on main interface '$MAIN_INTERFACE'."
   fi
 
@@ -269,9 +304,10 @@ create_new_tunnels() {
         SOURCE_IP="${SUBNET_BASE}.${LOCAL_IP_SUFFIX}"
         DEST_IP="${SUBNET_BASE}.${GATEWAY_IP_SUFFIX}"
 
-        PR="iptables -t nat -A PREROUTING -p $PROTOCOL --dport $SRC_PORT -j DNAT --to-destination ${DEST_IP}:${DST_PORT}"
-        PO="iptables -t nat -A POSTROUTING -p $PROTOCOL -d $DEST_IP --dport $DST_PORT -j SNAT --to-source $SOURCE_IP"
-        info "  Applying: $PR"; eval "$PR"; info "  Applying: $PO"; eval "$PO"
+        PR="iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p $PROTOCOL --dport $SRC_PORT -m comment --comment $TMGR_COMMENT -j DNAT --to-destination ${DEST_IP}:${DST_PORT}"
+        PO="iptables -t nat -A POSTROUTING -p $PROTOCOL -d $DEST_IP --dport $DST_PORT -m comment --comment $TMGR_COMMENT -j SNAT --to-source $SOURCE_IP"
+        info "  Applying: $PR"; ipt_apply_once "$PR"
+        info "  Applying: $PO"; ipt_apply_once "$PO"
         FORWARDING_RULES+=("$PR" "$PO")
         success "Forward added: $SRC_PORT → $DST_PORT/$PROTOCOL"
       done
@@ -294,6 +330,7 @@ create_new_tunnels() {
     printf "FORWARDING_RULES=("; for r in "${FORWARDING_RULES[@]}"; do printf "%q " "$r"; done; printf ")\n"
     echo "PING_INTERVAL=$PING_INTERVAL"
     echo "MONITOR_FAIL_THRESHOLD=$MONITOR_FAIL_THRESHOLD"
+    echo "TMGR_COMMENT=\"$TMGR_COMMENT\""
   } > "$CONFIG_FILE"
 
   create_persistence_service
@@ -322,7 +359,7 @@ set -u
 detect_local_ip() {
   ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if ($i=="src"){print $(i+1); exit}}' \
   || ip -4 addr show scope global | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1 \
-  || curl -4 -s icanhazip.com 2>/dev/null
+  || curl -4 -s --max-time 3 icanhazip.com 2>/dev/null
 }
 is_valid_ip(){ [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 resolve_once(){ local t="$1"; is_valid_ip "$t" && { echo "$t"; return 0; }; getent ahostsv4 "$t" | awk '{print $1; exit}'; }
@@ -338,7 +375,7 @@ fi
 
 # Restore NAT (idempotent)
 if declare -p MASQUERADE_RULES >/dev/null 2>&1; then
-  for cmd in "${MASQUERADE_RULES[@]}"; do chk="${cmd/ -A /-C }"; eval "$chk" &>/dev/null || eval "$cmd"; done
+  for cmd in "${MASQUERADE_RULES[@]}"; do chk="${cmd/ -A / -C }"; eval "$chk" &>/dev/null || eval "$cmd"; done
 fi
 
 # Re-create tunnels on boot (fresh resolve)
@@ -354,7 +391,7 @@ done
 
 # Restore custom forwards
 if declare -p FORWARDING_RULES >/dev/null 2>&1; then
-  for r in "${FORWARDING_RULES[@]}"; do chk="${r/-A /-C }"; eval "$chk" &>/dev/null || eval "$r"; done
+  for r in "${FORWARDING_RULES[@]}"; do chk="${r/ -A / -C }"; eval "$chk" &>/dev/null || eval "$r"; done
 fi
 BASH
   chmod +x "$PERSISTENCE_SCRIPT"
@@ -411,6 +448,10 @@ ensure_tun_present(){ # $1=tun $2=endpoint $3=cidr
 
 ensure_addr_up(){ ip addr show dev "$1" | grep -q " ${2//\//\\/} " || ip addr add "$2" dev "$1"; ip link set "$1" up || true; }
 
+# optional: limit repeated bounces
+BOUNCE_MAX=3
+declare -A BOUNCE_CNT
+
 while true; do
   for i in "${!REMOTE_ENDPOINTS[@]}"; do
     TUN="${TUN_PREFIX}$((i+1))"; EP="${REMOTE_ENDPOINTS[$i]}"; CIDR="${INTERNAL_TUNNEL_IPS[$i]}"
@@ -434,12 +475,19 @@ while true; do
 
     LOCAL_INNER="${CIDR%%/*}"; BASE="$(echo "$LOCAL_INNER" | cut -d'.' -f1-3)"; HOST="$(echo "$LOCAL_INNER" | cut -d'.' -f4)"
     if [[ "$HOST" == "$LOCAL_IP_SUFFIX" ]]; then PEER="$BASE.$GATEWAY_IP_SUFFIX"; else PEER="$BASE.$LOCAL_IP_SUFFIX"; fi
-    if ! ping -c "$THRESHOLD" -W 2 "$PEER" &>/dev/null; then
-      echo "[MONITOR] $TUN ping $PEER failed → bounce"
-      ip link set "$TUN" down 2>/dev/null || true
-      ip link set "$TUN" up   2>/dev/null || true
-      ip link show "$TUN" &>/dev/null || ensure_tun_present "$TUN" "$EP" "$CIDR"
-      ping -c 1 -W 2 "$PEER" &>/dev/null || echo "[MONITOR] $TUN still failing to ping $PEER"
+    if ! ping -c "$THRESHOLD" -W 3 "$PEER" &>/dev/null; then
+      BOUNCE_CNT["$TUN"]=$(( ${BOUNCE_CNT["$TUN"]:-0} + 1 ))
+      if (( ${BOUNCE_CNT["$TUN"]} <= BOUNCE_MAX )); then
+        echo "[MONITOR] $TUN ping $PEER failed → bounce (${BOUNCE_CNT["$TUN"]}/$BOUNCE_MAX)"
+        ip link set "$TUN" down 2>/dev/null || true
+        ip link set "$TUN" up   2>/dev/null || true
+        ip link show "$TUN" &>/dev/null || ensure_tun_present "$TUN" "$EP" "$CIDR"
+        ping -c 1 -W 3 "$PEER" &>/dev/null || echo "[MONITOR] $TUN still failing to ping $PEER"
+      else
+        echo "[MONITOR] $TUN persistent failure; skipping more bounces for now."
+      fi
+    else
+      BOUNCE_CNT["$TUN"]=0
     fi
   done
   sleep "${INTERVAL:-10}"
@@ -500,9 +548,10 @@ net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv4.conf.all.secure_redirects = 0
 net.ipv4.conf.default.secure_redirects = 0
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
+# IPv6 toggling could be environment-specific; leave enabled by default:
+# net.ipv6.conf.all.disable_ipv6 = 1
+# net.ipv6.conf.default.disable_ipv6 = 1
+# net.ipv6.conf.lo.disable_ipv6 = 1
 net.ipv4.neigh.default.gc_thresh1 = 1024
 net.ipv4.neigh.default.gc_thresh2 = 2048
 net.ipv4.neigh.default.gc_thresh3 = 4096
@@ -542,9 +591,10 @@ net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv4.conf.all.secure_redirects = 0
 net.ipv4.conf.default.secure_redirects = 0
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
+# IPv6 toggling could be environment-specific; leave enabled by default:
+# net.ipv6.conf.all.disable_ipv6 = 1
+# net.ipv6.conf.default.disable_ipv6 = 1
+# net.ipv6.conf.lo.disable_ipv6 = 1
 net.ipv4.neigh.default.gc_thresh1 = 1024
 net.ipv4.neigh.default.gc_thresh2 = 2048
 net.ipv4.neigh.default.gc_thresh3 = 4096
@@ -570,6 +620,7 @@ delete_all_tunnels(){
   systemctl stop tunnel-monitor.service tunnel-persistence.service 2>/dev/null || true
   systemctl disable tunnel-monitor.service tunnel-persistence.service 2>/dev/null || true
   remove_rules_from_config
+  cleanup_tmgr_rules
   remove_tunnel_masquerade_best_effort
   rm -f "$MONITOR_SERVICE" "$PERSISTENCE_SERVICE" "$MONITOR_SCRIPT" "$PERSISTENCE_SCRIPT" "$CONFIG_FILE"
   systemctl daemon-reload
