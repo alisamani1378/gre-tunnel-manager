@@ -257,11 +257,11 @@ create_new_tunnels() {
 
     local TUN="${TUN_PREFIX}$((idx+1))"; local SUBNET_BASE=$(( (idx+1) * 10 )); local TUN_IP
     if [[ $TUNNEL_IP_MODE == manual ]]; then
-      read -r -p "Internal IP for $TUN → $ENDPOINT ($RESOLVED_REMOTE) (e.g. ${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/24): " TUN_IP
-      [[ "${TUN_IP}" == */* ]] || TUN_IP="${TUN_IP}/24"
-      is_valid_ip "${TUN_IP%%/*}" || { warn "Invalid IP, using auto."; TUN_IP="${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/24"; }
+      read -r -p "Internal IP for $TUN → $ENDPOINT ($RESOLVED_REMOTE) (e.g. ${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/30): " TUN_IP
+      [[ "${TUN_IP}" == */* ]] || TUN_IP="${TUN_IP}/30"
+      is_valid_ip "${TUN_IP%%/*}" || { warn "Invalid IP, using auto."; TUN_IP="${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/30"; }
     else
-      TUN_IP="${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/24"
+      TUN_IP="${SUBNET_BASE}.0.0.$LOCAL_IP_SUFFIX/30"
     fi
     INTERNAL_TUNNEL_IPS+=("$TUN_IP")
 
