@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # ------------------------------------------------------------------
 #  Universal Tunnel Manager (GRE or IPIP) + Domain-aware + Monitors
-#  Author  : Ali Samani – 2025 (patched: GRE key + safe rebuild + skip gre0/ipip0)
+#  Author  : Ali Samani – 2025
+#  Patch   : No GRE key (compat), safe local selection per remote route
+#           + skip gre0/ipip0 deletion + safe rebuild + addr replace
 #  License : MIT
 # ------------------------------------------------------------------
 
@@ -18,9 +20,6 @@ MONITOR_SERVICE="/etc/systemd/system/tunnel-monitor.service"
 PING_INTERVAL=10            # seconds
 MONITOR_FAIL_THRESHOLD=3    # pings
 TMGR_COMMENT="TMGR"         # comment tag for firewall rules
-
-# For GRE: assign a unique key per tunnel to avoid gre0/filter collisions
-GRE_KEY_BASE=2000
 
 # ---------- Pretty print helpers ---------------------------------------------
 NC='\033[0m'; C_BLUE='\033[0;36m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_RED='\033[0;31m'
@@ -49,10 +48,18 @@ resolve_remote_once() { # hostname/ip -> one IPv4
 
 prompt_default(){ local a; read -r -p "$1 [$2]: " a; echo "${a:-$2}"; }
 
-detect_public_ip() {
-  ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if ($i=="src"){print $(i+1); exit}}' \
-  || ip -4 addr show scope global | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1 \
-  || curl -4 -s --max-time 3 icanhazip.com 2>/dev/null
+detect_iface_ip() { # $1=iface -> first global v4
+  ip -4 addr show dev "$1" scope global 2>/dev/null \
+    | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1
+}
+
+detect_src_ip_for_remote() { # $1=remote_ip $2=main_iface
+  local remote="$1" iface="$2" src=""
+  src="$(ip -4 route get "$remote" 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')" || true
+  if [[ -z "$src" ]]; then
+    src="$(detect_iface_ip "$iface" || true)"
+  fi
+  is_valid_ip "${src:-}" && echo "$src" || return 1
 }
 
 # ---------- iptables helpers (nft/legacy aware) -------------------------------
@@ -67,7 +74,6 @@ _eval_on_iptables_variants(){
   fi
 }
 
-# Apply an iptables rule once (idempotent):
 ipt_apply_once(){
   local add="$1"
   local chk="${add/ -A / -C }"
@@ -90,13 +96,13 @@ cleanup_tmgr_rules(){
   success "Tagged rules removed (if any)."
 }
 
-# ---------- Firewall cleanup helpers -----------------------------------------
 remove_rules_from_config(){
   [[ -f "$CONFIG_FILE" ]] || return 0
   set +u
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
   set -u
+
   local had=0
   if declare -p MASQUERADE_RULES >/dev/null 2>&1; then
     if ((${#MASQUERADE_RULES[@]} > 0)); then
@@ -110,6 +116,7 @@ remove_rules_from_config(){
       _eval_on_iptables_variants "$del"
     done
   fi
+
   if declare -p FORWARDING_RULES >/dev/null 2>&1; then
     ((had==0 && ${#FORWARDING_RULES[@]} > 0)) && { info "Removing previously configured forwarding rules from $CONFIG_FILE..."; had=1; }
     for r in "${FORWARDING_RULES[@]}"; do
@@ -119,6 +126,7 @@ remove_rules_from_config(){
       _eval_on_iptables_variants "$del"
     done
   fi
+
   [[ $had -eq 1 ]] && success "Old rules removed (if present)."
 }
 
@@ -167,7 +175,6 @@ remove_services_and_config(){
 safe_delete_tunnel_name(){
   local t="$1"
   [[ -z "$t" ]] && return 0
-  # never delete default kernel tunnels
   [[ "$t" == "gre0" || "$t" == "ipip0" ]] && return 0
   ip link set "$t" down 2>/dev/null || true
   ip tunnel del "$t" 2>/dev/null || true
@@ -184,44 +191,32 @@ delete_existing_tunnels_all_types(){
 
 tunnel_needs_rebuild(){
   # returns 0 if needs rebuild, 1 if OK
-  local tun="$1" mode="$2" local_ip="$3" remote_ip="$4" key="${5:-}"
+  local tun="$1" mode="$2" local_ip="$3" remote_ip="$4"
   local d
   d="$(ip -d tunnel show "$tun" 2>/dev/null || true)"
   [[ -z "$d" ]] && return 0
   [[ "$d" != *" local $local_ip "* ]] && return 0
   [[ "$d" != *" remote $remote_ip "* ]] && return 0
-  if [[ "$mode" == "gre" ]]; then
-    # key can appear as "key 2001" or "ikey 2001 okey 2001" depending on kernel/iproute2
-    if [[ -n "$key" ]] && [[ "$d" != *"key $key"* ]] && [[ "$d" != *"ikey $key"* ]]; then
-      return 0
-    fi
-  fi
   return 1
 }
 
 ensure_tunnel(){
-  local tun="$1" mode="$2" local_ip="$3" remote_ip="$4" cidr="$5" key="${6:-}"
+  local tun="$1" mode="$2" local_ip="$3" remote_ip="$4" cidr="$5"
 
   [[ -z "$tun" ]] && { error "Internal bug: empty tunnel name"; return 1; }
   [[ -z "$local_ip" || -z "$remote_ip" ]] && { error "Empty local/remote for $tun (local='$local_ip' remote='$remote_ip')"; return 1; }
 
   if ip link show "$tun" &>/dev/null; then
-    if tunnel_needs_rebuild "$tun" "$mode" "$local_ip" "$remote_ip" "$key"; then
+    if tunnel_needs_rebuild "$tun" "$mode" "$local_ip" "$remote_ip"; then
       warn "$tun exists but params differ -> rebuilding..."
       safe_delete_tunnel_name "$tun"
     fi
   fi
 
   if ! ip link show "$tun" &>/dev/null; then
-    if [[ "$mode" == "gre" ]]; then
-      # IMPORTANT: key avoids gre0/filter collision & duplicates
-      ip tunnel add "$tun" mode gre local "$local_ip" remote "$remote_ip" key "$key" ttl 255
-    else
-      ip tunnel add "$tun" mode ipip local "$local_ip" remote "$remote_ip" ttl 255
-    fi
+    ip tunnel add "$tun" mode "$mode" local "$local_ip" remote "$remote_ip" ttl 255
   fi
 
-  # replace addr avoids "File exists"
   ip addr replace "$cidr" dev "$tun"
   ip link set "$tun" up
   sysctl -w "net.ipv4.conf.${tun}.rp_filter=0" >/dev/null || true
@@ -294,10 +289,6 @@ create_new_tunnels() {
   info "Enabling IP forwarding..."
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
-  LOCAL_IP="$(detect_public_ip || true)"
-  [[ -z $LOCAL_IP ]] && { error "Couldn't auto-detect public IP"; exit 1; }
-  success "Public IP detected: $LOCAL_IP"
-
   # 4) Remote endpoints
   info "Enter remote endpoints (domain or IPv4). Blank to finish:"
   REMOTE_ENDPOINTS=()
@@ -321,7 +312,6 @@ create_new_tunnels() {
   # Create tunnels
   INTERNAL_TUNNEL_IPS=()
   RESOLVED_REMOTE_IPS=()
-  TUNNEL_KEYS=()
 
   info "Creating tunnels..."
   for idx in "${!REMOTE_ENDPOINTS[@]}"; do
@@ -336,7 +326,6 @@ create_new_tunnels() {
     local TUN="${TUN_PREFIX}$((idx+1))"
     local SUBNET_BASE=$(( (idx+1) * 10 ))
     local TUN_IP
-    local KEY=""
 
     if [[ $TUNNEL_IP_MODE == manual ]]; then
       read -r -p "Internal IP for $TUN → $ENDPOINT ($RESOLVED_REMOTE) (e.g. ${SUBNET_BASE}.0.0.${LOCAL_IP_SUFFIX}/30): " TUN_IP
@@ -347,22 +336,17 @@ create_new_tunnels() {
     fi
     INTERNAL_TUNNEL_IPS+=("$TUN_IP")
 
-    if [[ "$TUN_MODE" == "gre" ]]; then
-      KEY=$((GRE_KEY_BASE + idx + 1))
-      TUNNEL_KEYS+=("$KEY")
-      ensure_tunnel "$TUN" "$TUN_MODE" "$LOCAL_IP" "$RESOLVED_REMOTE" "$TUN_IP" "$KEY" \
-        || { warn "Failed to create $TUN (GRE). Skipping."; continue; }
-    else
-      TUNNEL_KEYS+=("") # keep same length
-      ensure_tunnel "$TUN" "$TUN_MODE" "$LOCAL_IP" "$RESOLVED_REMOTE" "$TUN_IP" \
-        || { warn "Failed to create $TUN (IPIP). Skipping."; continue; }
+    # IMPORTANT: choose correct local IP for THIS remote (prevents gre0 collision cases)
+    local TUN_LOCAL_IP
+    if ! TUN_LOCAL_IP="$(detect_src_ip_for_remote "$RESOLVED_REMOTE" "$MAIN_INTERFACE")"; then
+      warn "Cannot determine src(local) IP for route to $RESOLVED_REMOTE. Skipping $TUN."
+      continue
     fi
 
-    if [[ "$TUN_MODE" == "gre" ]]; then
-      echo "  • $TUN ↔ $ENDPOINT ($RESOLVED_REMOTE)  [$TUN_IP]  [key=$KEY]"
-    else
-      echo "  • $TUN ↔ $ENDPOINT ($RESOLVED_REMOTE)  [$TUN_IP]"
-    fi
+    ensure_tunnel "$TUN" "$TUN_MODE" "$TUN_LOCAL_IP" "$RESOLVED_REMOTE" "$TUN_IP" \
+      || { warn "Failed to create $TUN. Skipping."; continue; }
+
+    echo "  • $TUN ↔ $ENDPOINT ($RESOLVED_REMOTE)  [$TUN_IP]  [local=$TUN_LOCAL_IP]"
   done
 
   # NAT
@@ -411,16 +395,13 @@ create_new_tunnels() {
   info "Saving → $CONFIG_FILE"
   {
     echo "MAIN_INTERFACE=\"$MAIN_INTERFACE\""
-    echo "LOCAL_IP=\"$LOCAL_IP\""
     echo "LOCAL_IP_SUFFIX=$LOCAL_IP_SUFFIX"
     echo "GATEWAY_IP_SUFFIX=$GATEWAY_IP_SUFFIX"
     echo "TUN_MODE=\"$TUN_MODE\""
     echo "TUN_PREFIX=\"$TUN_PREFIX\""
-    echo "GRE_KEY_BASE=$GRE_KEY_BASE"
     printf "REMOTE_ENDPOINTS=("; for ep in "${REMOTE_ENDPOINTS[@]}"; do printf "%q " "$ep"; done; printf ")\n"
     printf "RESOLVED_REMOTE_IPS=("; for ipx in "${RESOLVED_REMOTE_IPS[@]}"; do printf "%q " "$ipx"; done; printf ")\n"
     printf "INTERNAL_TUNNEL_IPS=("; for tip in "${INTERNAL_TUNNEL_IPS[@]}"; do printf "%q " "$tip"; done; printf ")\n"
-    printf "TUNNEL_KEYS=("; for k in "${TUNNEL_KEYS[@]}"; do printf "%q " "$k"; done; printf ")\n"
     printf "MASQUERADE_RULES=("; for r in "${MASQUERADE_RULES[@]}"; do printf "%q " "$r"; done; printf ")\n"
     printf "FORWARDING_RULES=("; for r in "${FORWARDING_RULES[@]}"; do printf "%q " "$r"; done; printf ")\n"
     echo "PING_INTERVAL=$PING_INTERVAL"
@@ -452,22 +433,21 @@ set +u
 source /etc/tunnel-manager.conf
 set -u
 
-detect_local_ip() {
-  ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if ($i=="src"){print $(i+1); exit}}' \
-  || ip -4 addr show scope global | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1 \
-  || curl -4 -s --max-time 3 icanhazip.com 2>/dev/null
-}
 is_valid_ip(){ [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 resolve_once(){ local t="$1"; is_valid_ip "$t" && { echo "$t"; return 0; }; getent ahostsv4 "$t" | awk '{print $1; exit}'; }
 
-sysctl -w net.ipv4.ip_forward=1 >/dev/null
+detect_iface_ip() {
+  ip -4 addr show dev "$1" scope global 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1
+}
 
-CURRENT_LOCAL_IP="$(detect_local_ip || true)"
-if [[ -n "${CURRENT_LOCAL_IP:-}" && "${CURRENT_LOCAL_IP:-}" != "${LOCAL_IP:-}" ]]; then
-  echo "[INFO] LOCAL_IP changed: $LOCAL_IP -> $CURRENT_LOCAL_IP (update config)"
-  sed -i -E 's|^LOCAL_IP="[^"]*"|LOCAL_IP="'"$CURRENT_LOCAL_IP"'"|' /etc/tunnel-manager.conf || true
-  LOCAL_IP="$CURRENT_LOCAL_IP"
-fi
+detect_src_ip_for_remote() {
+  local remote="$1" iface="$2" src=""
+  src="$(ip -4 route get "$remote" 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')" || true
+  [[ -z "$src" ]] && src="$(detect_iface_ip "$iface" || true)"
+  is_valid_ip "${src:-}" && echo "$src" || return 1
+}
+
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
 # Restore NAT (idempotent)
 if declare -p MASQUERADE_RULES >/dev/null 2>&1; then
@@ -477,25 +457,22 @@ if declare -p MASQUERADE_RULES >/dev/null 2>&1; then
   done
 fi
 
-# Re-create tunnels on boot (fresh resolve)
+# Re-create tunnels on boot (fresh resolve + correct local per remote)
 for i in "${!REMOTE_ENDPOINTS[@]}"; do
   TUN="${TUN_PREFIX}$((i+1))"
   EP="${REMOTE_ENDPOINTS[$i]}"
   CIDR="${INTERNAL_TUNNEL_IPS[$i]}"
-  KEY="${TUNNEL_KEYS[$i]:-}"
 
   REM="$(resolve_once "$EP" || true)"
   [[ -z "$REM" ]] && { echo "[WARN] cannot resolve $EP"; continue; }
 
+  LOC="$(detect_src_ip_for_remote "$REM" "$MAIN_INTERFACE" || true)"
+  [[ -z "$LOC" ]] && { echo "[WARN] cannot determine local src for $REM"; continue; }
+
   ip link set "$TUN" down 2>/dev/null || true
   ip tunnel del "$TUN" 2>/dev/null || true
 
-  if [[ "$TUN_MODE" == "gre" ]]; then
-    ip tunnel add "$TUN" mode gre remote "$REM" local "$LOCAL_IP" key "$KEY" ttl 255
-  else
-    ip tunnel add "$TUN" mode ipip remote "$REM" local "$LOCAL_IP" ttl 255
-  fi
-
+  ip tunnel add "$TUN" mode "$TUN_MODE" remote "$REM" local "$LOC" ttl 255
   ip addr replace "$CIDR" dev "$TUN" 2>/dev/null || true
   ip link set "$TUN" up
   sysctl -w "net.ipv4.conf.${TUN}.rp_filter=0" >/dev/null || true
@@ -513,7 +490,7 @@ BASH
 
   cat > "$PERSISTENCE_SERVICE" <<EOF
 [Unit]
-Description=Restore GRE/IPIP tunnels at boot (domain-aware; detect local IP once)
+Description=Restore GRE/IPIP tunnels at boot (domain-aware; local per remote)
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=$CONFIG_FILE
@@ -550,24 +527,33 @@ resolve_all(){
   [[ -n $ips ]] && echo "$ips" || return 1
 }
 
-ensure_tun_present(){ # $1=tun $2=endpoint $3=cidr $4=key
-  local tun="$1" ep="$2" cidr="$3" key="${4:-}" set first
+detect_iface_ip() {
+  ip -4 addr show dev "$1" scope global 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1
+}
+
+detect_src_ip_for_remote() {
+  local remote="$1" iface="$2" src=""
+  src="$(ip -4 route get "$remote" 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')" || true
+  [[ -z "$src" ]] && src="$(detect_iface_ip "$iface" || true)"
+  is_valid_ip "${src:-}" && echo "$src" || return 1
+}
+
+ensure_tun_present(){ # $1=tun $2=endpoint $3=cidr
+  local tun="$1" ep="$2" cidr="$3" set first loc
   ip link show "$tun" &>/dev/null && return 0
 
   set="$(resolve_all "$ep" || true)"
   first="$(awk '{print $1}' <<<"$set")"
   [[ -z "$first" ]] && { echo "[MONITOR] WARN: cannot resolve $ep"; return 1; }
 
-  if [[ "$TUN_MODE" == "gre" ]]; then
-    ip tunnel add "$tun" mode gre remote "$first" local "$LOCAL_IP" key "$key" ttl 255 || return 1
-  else
-    ip tunnel add "$tun" mode ipip remote "$first" local "$LOCAL_IP" ttl 255 || return 1
-  fi
+  loc="$(detect_src_ip_for_remote "$first" "$MAIN_INTERFACE" || true)"
+  [[ -z "$loc" ]] && { echo "[MONITOR] WARN: cannot determine local src for $first"; return 1; }
 
+  ip tunnel add "$tun" mode "$TUN_MODE" remote "$first" local "$loc" ttl 255 || return 1
   ip addr replace "$cidr" dev "$tun" 2>/dev/null || true
   ip link set "$tun" up || true
   sysctl -w "net.ipv4.conf.${tun}.rp_filter=0" >/dev/null || true
-  echo "[MONITOR] recreated $tun → remote=$first cidr=$cidr mode=$TUN_MODE key=${key:-none}"
+  echo "[MONITOR] recreated $tun → remote=$first local=$loc cidr=$cidr mode=$TUN_MODE"
   return 0
 }
 
@@ -584,27 +570,22 @@ while true; do
     TUN="${TUN_PREFIX}$((i+1))"
     EP="${REMOTE_ENDPOINTS[$i]}"
     CIDR="${INTERNAL_TUNNEL_IPS[$i]}"
-    KEY="${TUNNEL_KEYS[$i]:-}"
 
-    ensure_tun_present "$TUN" "$EP" "$CIDR" "$KEY" || { sleep "$INTERVAL"; continue; }
+    ensure_tun_present "$TUN" "$EP" "$CIDR" || { sleep "$INTERVAL"; continue; }
     ensure_addr_up "$TUN" "$CIDR"
 
-    # DNS change handling (domain endpoints)
+    # DNS change handling
     if ! is_valid_ip "$EP"; then
       NEW_SET="$(resolve_all "$EP" || true)"
       CUR_REMOTE="$(ip -d tunnel show "$TUN" 2>/dev/null | awk '/remote/ {for(i=1;i<=NF;i++) if($i=="remote"){print $(i+1); exit}}')"
       if [[ -n "$NEW_SET" ]] && ! grep -qw "$CUR_REMOTE" <<<"$NEW_SET"; then
         NEW_REMOTE="$(awk '{print $1; exit}' <<<"$NEW_SET")"
+        NEW_LOC="$(detect_src_ip_for_remote "$NEW_REMOTE" "$MAIN_INTERFACE" || true)"
         echo "[MONITOR] $TUN remote changed for $EP: $CUR_REMOTE -> $NEW_REMOTE (rebuild)"
         ip link set "$TUN" down 2>/dev/null || true
         ip tunnel del "$TUN" 2>/dev/null || true
-
-        if [[ "$TUN_MODE" == "gre" ]]; then
-          ip tunnel add "$TUN" mode gre remote "$NEW_REMOTE" local "$LOCAL_IP" key "$KEY" ttl 255
-        else
-          ip tunnel add "$TUN" mode ipip remote "$NEW_REMOTE" local "$LOCAL_IP" ttl 255
-        fi
-
+        [[ -n "$NEW_LOC" ]] || { echo "[MONITOR] WARN: cannot determine local src for $NEW_REMOTE"; continue; }
+        ip tunnel add "$TUN" mode "$TUN_MODE" remote "$NEW_REMOTE" local "$NEW_LOC" ttl 255
         ensure_addr_up "$TUN" "$CIDR"
         sysctl -w "net.ipv4.conf.${TUN}.rp_filter=0" >/dev/null || true
       fi
@@ -621,7 +602,7 @@ while true; do
         echo "[MONITOR] $TUN ping $PEER failed → bounce (${BOUNCE_CNT["$TUN"]}/$BOUNCE_MAX)"
         ip link set "$TUN" down 2>/dev/null || true
         ip link set "$TUN" up   2>/dev/null || true
-        ip link show "$TUN" &>/dev/null || ensure_tun_present "$TUN" "$EP" "$CIDR" "$KEY"
+        ip link show "$TUN" &>/dev/null || ensure_tun_present "$TUN" "$EP" "$CIDR"
         ping -c 1 -W 3 "$PEER" &>/dev/null || echo "[MONITOR] $TUN still failing to ping $PEER"
       else
         echo "[MONITOR] $TUN persistent failure; skipping more bounces for now."
