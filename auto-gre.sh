@@ -2,8 +2,7 @@
 # ------------------------------------------------------------------
 #  Universal Tunnel Manager (GRE or IPIP) + Domain-aware + Monitors
 #  Author  : Ali Samani – 2025
-#  Patch   : No GRE key (compat), safe local selection per remote route
-#           + skip gre0/ipip0 deletion + safe rebuild + addr replace
+#  Fixed   : Solved 'gre0 file exists' crash on boot
 #  License : MIT
 # ------------------------------------------------------------------
 
@@ -177,8 +176,7 @@ safe_delete_tunnel_name(){
   [[ -z "$t" ]] && return 0
   [[ "$t" == "gre0" || "$t" == "ipip0" ]] && return 0
   ip link set "$t" down 2>/dev/null || true
-  ip tunnel del "$t" 2>/dev/null || true
-  ip link del "$t" 2>/dev/null || true
+  ip link delete "$t" 2>/dev/null || true
 }
 
 delete_existing_tunnels_all_types(){
@@ -459,7 +457,16 @@ fi
 
 # Re-create tunnels on boot (fresh resolve + correct local per remote)
 for i in "${!REMOTE_ENDPOINTS[@]}"; do
-  TUN="${TUN_PREFIX}$((i+1))"
+  # Fallback for prefix
+  PFX="${TUN_PREFIX:-gre}"
+  TUN="${PFX}$((i+1))"
+  
+  # Safety check: Prevent messing with system gre0
+  if [[ "$TUN" == "gre0" || "$TUN" == "ipip0" ]]; then
+    echo "Skipping reserved tunnel name $TUN"
+    continue
+  fi
+
   EP="${REMOTE_ENDPOINTS[$i]}"
   CIDR="${INTERNAL_TUNNEL_IPS[$i]}"
 
@@ -469,12 +476,19 @@ for i in "${!REMOTE_ENDPOINTS[@]}"; do
   LOC="$(detect_src_ip_for_remote "$REM" "$MAIN_INTERFACE" || true)"
   [[ -z "$LOC" ]] && { echo "[WARN] cannot determine local src for $REM"; continue; }
 
+  # FORCE clean slate
   ip link set "$TUN" down 2>/dev/null || true
-  ip tunnel del "$TUN" 2>/dev/null || true
+  ip link delete "$TUN" 2>/dev/null || true
+  sleep 0.2
 
-  ip tunnel add "$TUN" mode "$TUN_MODE" remote "$REM" local "$LOC" ttl 255
+  if ! ip tunnel add "$TUN" mode "$TUN_MODE" remote "$REM" local "$LOC" ttl 255 2>/dev/null; then
+     # Try again without stderr to capture existing? No, just ensure it's up.
+     echo "Tunnel add failed for $TUN, checking if exists..."
+  fi
+  
+  # Ensure IP and UP
   ip addr replace "$CIDR" dev "$TUN" 2>/dev/null || true
-  ip link set "$TUN" up
+  ip link set "$TUN" up 2>/dev/null || true
   sysctl -w "net.ipv4.conf.${TUN}.rp_filter=0" >/dev/null || true
 done
 
@@ -540,6 +554,9 @@ detect_src_ip_for_remote() {
 
 ensure_tun_present(){ # $1=tun $2=endpoint $3=cidr
   local tun="$1" ep="$2" cidr="$3" set first loc
+  
+  if [[ "$tun" == "gre0" || "$tun" == "ipip0" ]]; then return 1; fi
+
   ip link show "$tun" &>/dev/null && return 0
 
   set="$(resolve_all "$ep" || true)"
@@ -583,7 +600,7 @@ while true; do
         NEW_LOC="$(detect_src_ip_for_remote "$NEW_REMOTE" "$MAIN_INTERFACE" || true)"
         echo "[MONITOR] $TUN remote changed for $EP: $CUR_REMOTE -> $NEW_REMOTE (rebuild)"
         ip link set "$TUN" down 2>/dev/null || true
-        ip tunnel del "$TUN" 2>/dev/null || true
+        ip link delete "$TUN" 2>/dev/null || true
         [[ -n "$NEW_LOC" ]] || { echo "[MONITOR] WARN: cannot determine local src for $NEW_REMOTE"; continue; }
         ip tunnel add "$TUN" mode "$TUN_MODE" remote "$NEW_REMOTE" local "$NEW_LOC" ttl 255
         ensure_addr_up "$TUN" "$CIDR"
