@@ -314,8 +314,24 @@ create_new_tunnels() {
   # Detect public IP (critical for AWS / NAT environments)
   local PUBLIC_IP="" IFACE_IP=""
   IFACE_IP="$(detect_iface_ip "$MAIN_INTERFACE" || true)"
-  info "Detecting public IP..."
-  PUBLIC_IP="$(detect_public_ip || true)"
+
+  local pub_mode
+  pub_mode=$(prompt_default "Public IP detection (1=auto-detect, 2=enter manually)" "1")
+  if [[ "$pub_mode" == "2" ]]; then
+    while true; do
+      read -r -p "Enter your public IP: " PUBLIC_IP
+      if is_valid_ip "$PUBLIC_IP"; then
+        break
+      else
+        warn "Invalid IP. Try again."
+      fi
+    done
+    success "Public IP set to: $PUBLIC_IP"
+  else
+    info "Detecting public IP..."
+    PUBLIC_IP="$(detect_public_ip || true)"
+  fi
+
   if [[ -n "$PUBLIC_IP" && "$PUBLIC_IP" != "${IFACE_IP:-}" ]]; then
     warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     warn "NAT/Cloud detected!  Interface IP: ${IFACE_IP:-N/A}"
