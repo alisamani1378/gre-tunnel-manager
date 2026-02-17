@@ -61,6 +61,33 @@ detect_src_ip_for_remote() { # $1=remote_ip $2=main_iface
   is_valid_ip "${src:-}" && echo "$src" || return 1
 }
 
+detect_public_ip() { # detect public/external IP (AWS IMDS + fallback)
+  local pub="" token=""
+  # AWS IMDS v2 (token-based)
+  token=$(curl -sf -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 10" \
+    "http://169.254.169.254/latest/api/token" 2>/dev/null) || true
+  if [[ -n "$token" ]]; then
+    pub=$(curl -sf -H "X-aws-ec2-metadata-token: $token" \
+      "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null) || true
+  fi
+  # AWS IMDS v1 fallback
+  if [[ -z "$pub" || ! "$pub" =~ ^[0-9] ]]; then
+    pub=$(curl -sf --connect-timeout 2 \
+      "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null) || true
+  fi
+  # External service fallbacks
+  if [[ -z "$pub" || ! "$pub" =~ ^[0-9] ]]; then
+    pub=$(curl -sf --connect-timeout 3 "https://ifconfig.me" 2>/dev/null) || true
+  fi
+  if [[ -z "$pub" || ! "$pub" =~ ^[0-9] ]]; then
+    pub=$(curl -sf --connect-timeout 3 "https://icanhazip.com" 2>/dev/null | tr -d '[:space:]') || true
+  fi
+  if [[ -z "$pub" || ! "$pub" =~ ^[0-9] ]]; then
+    pub=$(curl -sf --connect-timeout 3 "https://api.ipify.org" 2>/dev/null) || true
+  fi
+  is_valid_ip "${pub:-}" && echo "$pub" || return 1
+}
+
 # ---------- iptables helpers (nft/legacy aware) -------------------------------
 _use_legacy() { command -v iptables-legacy >/dev/null 2>&1; }
 
@@ -284,6 +311,25 @@ create_new_tunnels() {
   done
   success "Interface '$MAIN_INTERFACE' selected."
 
+  # Detect public IP (critical for AWS / NAT environments)
+  local PUBLIC_IP="" IFACE_IP=""
+  IFACE_IP="$(detect_iface_ip "$MAIN_INTERFACE" || true)"
+  info "Detecting public IP..."
+  PUBLIC_IP="$(detect_public_ip || true)"
+  if [[ -n "$PUBLIC_IP" && "$PUBLIC_IP" != "${IFACE_IP:-}" ]]; then
+    warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    warn "NAT/Cloud detected!  Interface IP: ${IFACE_IP:-N/A}"
+    warn "                     Public IP   : $PUBLIC_IP"
+    warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    info "Tunnel 'local' will use private IP ($IFACE_IP) — this is correct."
+    info "The PEER server must set your PUBLIC IP ($PUBLIC_IP) as its remote endpoint."
+  elif [[ -n "$PUBLIC_IP" ]]; then
+    info "Public IP: $PUBLIC_IP (same as interface — no NAT detected)"
+  else
+    PUBLIC_IP="${IFACE_IP:-unknown}"
+    warn "Could not detect public IP. Using interface IP: $PUBLIC_IP"
+  fi
+
   info "Enabling IP forwarding..."
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
@@ -344,8 +390,20 @@ create_new_tunnels() {
     ensure_tunnel "$TUN" "$TUN_MODE" "$TUN_LOCAL_IP" "$RESOLVED_REMOTE" "$TUN_IP" \
       || { warn "Failed to create $TUN. Skipping."; continue; }
 
-    echo "  • $TUN ↔ $ENDPOINT ($RESOLVED_REMOTE)  [$TUN_IP]  [local=$TUN_LOCAL_IP]"
+    echo "  • $TUN ↔ $ENDPOINT ($RESOLVED_REMOTE)  [$TUN_IP]  [local=$TUN_LOCAL_IP]  [public=$PUBLIC_IP]"
   done
+
+  # Summary for NAT/AWS users
+  if [[ -n "$PUBLIC_IP" && "$PUBLIC_IP" != "${IFACE_IP:-}" ]]; then
+    echo ""
+    info "┌─────────────────────────────────────────────────────────────┐"
+    info "│  AWS/NAT Setup Guide:                                      │"
+    info "│  On the PEER server, use this as remote endpoint:           │"
+    info "│  → $PUBLIC_IP                                               │"
+    info "│  (NOT the private IP $IFACE_IP)                             │"
+    info "└─────────────────────────────────────────────────────────────┘"
+    echo ""
+  fi
 
   # NAT
   info "Configuring NAT..."
@@ -393,6 +451,7 @@ create_new_tunnels() {
   info "Saving → $CONFIG_FILE"
   {
     echo "MAIN_INTERFACE=\"$MAIN_INTERFACE\""
+    echo "PUBLIC_IP=\"$PUBLIC_IP\""
     echo "LOCAL_IP_SUFFIX=$LOCAL_IP_SUFFIX"
     echo "GATEWAY_IP_SUFFIX=$GATEWAY_IP_SUFFIX"
     echo "TUN_MODE=\"$TUN_MODE\""
@@ -445,7 +504,36 @@ detect_src_ip_for_remote() {
   is_valid_ip "${src:-}" && echo "$src" || return 1
 }
 
+detect_public_ip() {
+  local pub="" token=""
+  token=$(curl -sf -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 10" \
+    "http://169.254.169.254/latest/api/token" 2>/dev/null) || true
+  if [[ -n "$token" ]]; then
+    pub=$(curl -sf -H "X-aws-ec2-metadata-token: $token" \
+      "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null) || true
+  fi
+  if [[ -z "$pub" || ! "$pub" =~ ^[0-9] ]]; then
+    pub=$(curl -sf --connect-timeout 2 \
+      "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null) || true
+  fi
+  if [[ -z "$pub" || ! "$pub" =~ ^[0-9] ]]; then
+    pub=$(curl -sf --connect-timeout 3 "https://ifconfig.me" 2>/dev/null) || true
+  fi
+  if [[ -z "$pub" || ! "$pub" =~ ^[0-9] ]]; then
+    pub=$(curl -sf --connect-timeout 3 "https://api.ipify.org" 2>/dev/null) || true
+  fi
+  is_valid_ip "${pub:-}" && echo "$pub" || return 1
+}
+
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+# Log public IP info for NAT/AWS environments
+IFACE_IP="$(detect_iface_ip "$MAIN_INTERFACE" 2>/dev/null || true)"
+DETECTED_PUBLIC="$(detect_public_ip || true)"
+if [[ -n "$DETECTED_PUBLIC" && "$DETECTED_PUBLIC" != "${IFACE_IP:-}" ]]; then
+  echo "[INFO] NAT/Cloud detected: interface=$IFACE_IP public=$DETECTED_PUBLIC"
+  echo "[INFO] Tunnels use private IP ($IFACE_IP) as local — peers should use $DETECTED_PUBLIC as remote"
+fi
 
 # Restore NAT (idempotent)
 if declare -p MASQUERADE_RULES >/dev/null 2>&1; then
